@@ -1573,7 +1573,23 @@ func createRef(t *testing.T, cm cache.Manager, files []string) cache.ImmutableRe
 	return ref
 }
 
-func setupCacheManager(t *testing.T, tmpdir string, snapshotterName string, snapshotter snapshots.Snapshotter) (cache.Manager, func()) {
+func createRefFunc(t testing.TB, cm cache.Manager, fn func(root string) error) cache.ImmutableRef {
+	mref, err := cm.New(t.Context(), nil, nil, cache.CachePolicyRetain)
+	require.NoError(t, err)
+	mounts, err := mref.Mount(t.Context(), false, nil)
+	require.NoError(t, err)
+	lm := snapshot.LocalMounter(mounts)
+	mp, err := lm.Mount()
+	require.NoError(t, err)
+	err = fn(mp)
+	require.NoError(t, lm.Unmount())
+	require.NoError(t, err)
+	ref, err := mref.Commit(t.Context())
+	require.NoError(t, err)
+	return ref
+}
+
+func setupCacheManager(t testing.TB, tmpdir string, snapshotterName string, snapshotter snapshots.Snapshotter) (cache.Manager, func()) {
 	store, err := local.NewStore(tmpdir)
 	require.NoError(t, err)
 

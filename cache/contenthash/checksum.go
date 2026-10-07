@@ -1269,7 +1269,10 @@ var pool32K = pools.New(func() *[]byte {
 
 func poolsCopy(dst io.Writer, src io.Reader) (written int64, err error) {
 	buf := pool32K.Get()
-	written, err = io.CopyBuffer(dst, src, *buf)
+	// Hide the WriterTo of src: *os.File implements it, and io.CopyBuffer
+	// would then call it instead of using buf, which allocates a new 32K
+	// buffer for every file.
+	written, err = io.CopyBuffer(dst, struct{ io.Reader }{src}, *buf)
 	pool32K.Put(buf)
 	return
 }
