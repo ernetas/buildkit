@@ -56,6 +56,11 @@ func NewWithRewriteTimestamp(ctx context.Context, cs content.Store, desc ocispec
 	c.decompress = from.Decompress
 	c.rewriteTimestamp = rewriteTimestamp
 	c.immDiffIDs = immDiffIDs
+	if rewriteTimestamp != nil && c.finalize == nil {
+		if key, ok := comp.OutputKey(); ok {
+			c.rewrittenLabel = rewrittenBlobLabel(*rewriteTimestamp, key)
+		}
+	}
 
 	return (&c).convert, nil
 }
@@ -67,6 +72,9 @@ type conversion struct {
 	finalize         compression.Finalizer
 	rewriteTimestamp *time.Time
 	immDiffIDs       map[digest.Digest]struct{} // diffIDs of immutable layers
+	// rewrittenLabel is the label on the source blob that names the blob this
+	// conversion produced from it before. Empty if the result is not reused.
+	rewrittenLabel string
 }
 
 var bufioPool = pools.New(func() *bufio.Writer {
@@ -88,6 +96,11 @@ func rewriteTimestampInTarHeader(epoch time.Time) tarconverter.HeaderConverter {
 }
 
 func (c *conversion) convert(ctx context.Context, cs content.Store, desc ocispecs.Descriptor) (*ocispecs.Descriptor, error) {
+	if c.rewrittenLabel != "" {
+		if newDesc, ok := c.lookupRewritten(ctx, cs, desc); ok {
+			return newDesc, nil
+		}
+	}
 	bklog.G(ctx).WithField("blob", desc).WithField("target", c.target).Debugf("converting blob to the target compression")
 	// prepare the source and destination
 	labelz := make(map[string]string)
@@ -173,6 +186,11 @@ func (c *conversion) convert(ctx context.Context, cs content.Store, desc ocispec
 			return nil, errors.Wrapf(err, "failed finalize compression")
 		}
 		maps.Copy(newDesc.Annotations, a)
+	}
+	if c.rewrittenLabel != "" {
+		if err := c.recordRewritten(ctx, cs, desc, info, diffID.Digest()); err != nil {
+			bklog.G(ctx).WithError(err).WithField("blob", desc).Warn("failed to record the blob with rewritten timestamps")
+		}
 	}
 	return &newDesc, nil
 }

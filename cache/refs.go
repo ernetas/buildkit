@@ -27,6 +27,7 @@ import (
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/compression"
+	"github.com/moby/buildkit/util/converter"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/overlay"
@@ -368,20 +369,26 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 		}
 		if dgst := cr.getBlob(); dgst != "" {
 			added := make(map[digest.Digest]struct{})
-			info, err := cr.cm.ContentStore.Info(ctx, dgst)
-			if err == nil {
-				usage.Size += info.Size
-				added[dgst] = struct{}{}
-			}
-			walkBlobVariantsOnly(ctx, cr.cm.ContentStore, dgst, func(desc ocispecs.Descriptor) bool {
-				if _, ok := added[desc.Digest]; !ok {
-					if info, err := cr.cm.ContentStore.Info(ctx, desc.Digest); err == nil {
-						usage.Size += info.Size
-						added[desc.Digest] = struct{}{}
-					}
+			var rewritten []digest.Digest
+			add := func(dgst digest.Digest) {
+				if _, ok := added[dgst]; ok {
+					return
 				}
+				if info, err := cr.cm.ContentStore.Info(ctx, dgst); err == nil {
+					usage.Size += info.Size
+					added[dgst] = struct{}{}
+					rewritten = append(rewritten, converter.RewrittenBlobs(info.Labels)...)
+				}
+			}
+			add(dgst)
+			walkBlobVariantsOnly(ctx, cr.cm.ContentStore, dgst, func(desc ocispecs.Descriptor) bool {
+				add(desc.Digest)
 				return true
 			}, nil)
+			// blobs with rewritten timestamps live as long as their source
+			for _, dgst := range rewritten {
+				add(dgst)
+			}
 		}
 		cr.mu.Lock()
 		cr.queueSize(usage.Size)
