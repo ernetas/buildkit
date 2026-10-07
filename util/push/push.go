@@ -249,13 +249,15 @@ func childrenHandler(provider content.Provider) images.HandlerFunc {
 					descs = append(descs, m)
 				}
 			}
-		case images.MediaTypeDockerSchema2Layer, images.MediaTypeDockerSchema2LayerGzip,
-			images.MediaTypeDockerSchema2Config, ocispecs.MediaTypeImageConfig,
-			ocispecs.MediaTypeImageLayer, ocispecs.MediaTypeImageLayerGzip,
+		case images.MediaTypeDockerSchema2Config, ocispecs.MediaTypeImageConfig,
 			intoto.PayloadType:
 			// childless data types.
 			return nil, nil
 		default:
+			if images.IsLayerType(desc.MediaType) {
+				// layers of any compression are childless.
+				return nil, nil
+			}
 			bklog.G(ctx).Warnf("encountered unknown type %v; children may not be fetched", desc.MediaType)
 		}
 
@@ -275,13 +277,9 @@ func updateDistributionSourceHandler(manager content.Manager, pushF images.Handl
 	}
 
 	return images.HandlerFunc(func(ctx context.Context, desc ocispecs.Descriptor) ([]ocispecs.Descriptor, error) {
-		var islayer bool
-
-		switch desc.MediaType {
-		case images.MediaTypeDockerSchema2Layer, images.MediaTypeDockerSchema2LayerGzip,
-			ocispecs.MediaTypeImageLayer, ocispecs.MediaTypeImageLayerGzip:
-			islayer = true
-		}
+		// Label every layer, not only tar and tar+gzip: without the label a
+		// zstd layer cannot be mounted from this repository on a later push.
+		islayer := images.IsLayerType(desc.MediaType)
 
 		children, err := pushF(ctx, desc)
 		if err != nil {
