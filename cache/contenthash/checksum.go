@@ -513,12 +513,11 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 
 	includedPaths := make([]*includedPath, 0, 2)
 
-	txn := cc.tree.Txn()
-	root = txn.Root()
+	root = cc.tree.Root()
 	var (
-		updated        bool
 		iter           *iradix.Iterator[*CacheRecord]
 		k              []byte
+		v              *CacheRecord
 		keyOk          bool
 		origPrefix     string
 		resolvedPrefix string
@@ -549,16 +548,21 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 	if origPrefix != "" {
 		if keyOk {
 			iter.SeekLowerBound(append(slices.Clone(k), 0))
+			v, _ = root.Get(k)
 		}
 
 		resolvedPrefix = convertKeyToPath(k)
 	} else {
-		k, _, keyOk = iter.Next()
+		k, v, keyOk = iter.Next()
 	}
 
 	var (
 		parentDirHeaders []*includedPath
 		lastMatchedDir   string
+		// The paths to checksum, in walk order. They are checksummed after
+		// the walk so that the files below them can be hashed in parallel.
+		toChecksum []*includedPath
+		keys       [][]byte
 	)
 
 	for keyOk {
@@ -596,7 +600,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 			fn = fn[:len(fn)-1]
 			if fn == p && endsInSep {
 				// We don't include the metadata header for a source dir which ends with a separator
-				k, _, keyOk = iter.Next()
+				k, v, keyOk = iter.Next()
 				continue
 			}
 		}
@@ -614,7 +618,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 					return "", nil, err
 				}
 				if !include {
-					k, _, keyOk = iter.Next()
+					k, v, keyOk = iter.Next()
 					continue
 				}
 				lastMatchedDir = fn
@@ -648,17 +652,15 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 		}
 
 		if !shouldInclude && !dirHeader {
-			k, _, keyOk = iter.Next()
+			k, v, keyOk = iter.Next()
 			continue
 		}
 
-		cr, upt, err := cc.checksum(ctx, root, txn, m, k, false)
-		if err != nil {
-			return "", nil, err
-		}
-		if upt {
-			updated = true
-		}
+		// k is a key of the tree, so v is the record checksum() resolves it
+		// to. Only the type is needed here, the digest is filled in below.
+		toChecksum = append(toChecksum, maybeIncludedPath)
+		keys = append(keys, k)
+		cr := v
 
 		if cr.Type == CacheRecordTypeDir {
 			// We only hash dir headers and files, not dir contents. Hashing
@@ -666,7 +668,6 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 			// dir.
 			shouldInclude = false
 		}
-		maybeIncludedPath.record = cr
 
 		if shouldInclude {
 			for _, parentDir := range parentDirHeaders {
@@ -687,7 +688,24 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 			parentDirHeaders = append(parentDirHeaders, maybeIncludedPath)
 		}
 
-		k, _, keyOk = iter.Next()
+		k, v, keyOk = iter.Next()
+	}
+
+	tree, updated, err := cc.prehash(ctx, cc.tree, m, keys, false)
+	if err != nil {
+		return "", nil, err
+	}
+	txn := tree.Txn()
+	root = txn.Root()
+	for i, ip := range toChecksum {
+		cr, upt, err := cc.checksum(ctx, root, txn, m, keys[i], false)
+		if err != nil {
+			return "", nil, err
+		}
+		if upt {
+			updated = true
+		}
+		ip.record = cr
 	}
 
 	cc.tree = txn.Commit()
@@ -874,14 +892,18 @@ func (cc *cacheContext) scanChecksum(ctx context.Context, m *mount, p string, fo
 		}
 	}
 	k := convertPathToKey(p)
-	txn := cc.tree.Txn()
+	tree, prehashed, err := cc.prehash(ctx, cc.tree, m, [][]byte{k}, followTrailing)
+	if err != nil {
+		return nil, err
+	}
+	txn := tree.Txn()
 	root = txn.Root()
 	cr, updated, err := cc.checksum(ctx, root, txn, m, k, followTrailing)
 	if err != nil {
 		return nil, err
 	}
 	cc.tree = txn.Commit()
-	cc.dirty = updated
+	cc.dirty = updated || prehashed
 	return cr, err
 }
 
