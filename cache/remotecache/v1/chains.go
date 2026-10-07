@@ -343,25 +343,14 @@ func (c *item) addChild(src *item, index int, selector string) {
 }
 
 func (c *item) addResult(r solver.CacheExportResult) {
-	var exists bool
 	for _, rr := range c.results {
-		if !rr.CreatedAt.Equal(r.CreatedAt) {
-			continue
+		if rr.CreatedAt.Equal(r.CreatedAt) && slices.EqualFunc(rr.Result.Descriptors, r.Result.Descriptors, func(a, b ocispecs.Descriptor) bool {
+			return a.Digest == b.Digest
+		}) {
+			return
 		}
-		if len(rr.Result.Descriptors) != len(r.Result.Descriptors) {
-			continue
-		}
-		for i, d := range rr.Result.Descriptors {
-			if d.Digest != r.Result.Descriptors[i].Digest {
-				continue
-			}
-		}
-		exists = true
-		break
 	}
-	if !exists {
-		c.results = append(c.results, r)
-	}
+	c.results = append(c.results, r)
 }
 
 func (c *item) computeID() {
@@ -399,7 +388,9 @@ func (c *item) bestResult() *solver.CacheExportResult {
 	if len(c.results) == 0 {
 		return nil
 	}
-	slices.SortFunc(c.results, func(a, b solver.CacheExportResult) int {
+	// Stable, so that among results with the same CreatedAt (e.g. compression
+	// variants of one record) the first one added is exported on every run.
+	slices.SortStableFunc(c.results, func(a, b solver.CacheExportResult) int {
 		return b.CreatedAt.Compare(a.CreatedAt)
 	})
 	return &c.results[0]

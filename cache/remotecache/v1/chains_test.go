@@ -2,6 +2,7 @@ package cacheimport
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -157,6 +158,60 @@ func TestMarshalLayerMediaTypes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAddResultKeepsDistinctResults(t *testing.T) {
+	cc := NewCacheChains()
+	now := time.Now()
+	result := func(blobs ...string) solver.CacheExportResult {
+		r := &solver.Remote{}
+		for _, b := range blobs {
+			r.Descriptors = append(r.Descriptors, ocispecs.Descriptor{Digest: dgst(b)})
+		}
+		return solver.CacheExportResult{CreatedAt: now, Result: r}
+	}
+
+	key := outputKey(dgst("foo"), 0)
+	rec, _, err := cc.Add(key, nil, []solver.CacheExportResult{result("base", "gzip")})
+	require.NoError(t, err)
+
+	// Same CreatedAt and same length but a different blob is a different
+	// result, e.g. another compression variant of the topmost layer.
+	_, _, err = cc.Add(key, nil, []solver.CacheExportResult{result("base", "zstd")})
+	require.NoError(t, err)
+	require.Len(t, rec.(*item).results, 2)
+
+	// Adding either of them again is a no-op.
+	_, _, err = cc.Add(key, nil, []solver.CacheExportResult{result("base", "gzip"), result("base", "zstd")})
+	require.NoError(t, err)
+	require.Len(t, rec.(*item).results, 2)
+}
+
+func TestBestResultTieKeepsFirstAdded(t *testing.T) {
+	now := time.Now()
+	// An older result first, then many results with equal CreatedAt. The
+	// older one must not win, and among the others the first one added must.
+	results := []solver.CacheExportResult{{
+		CreatedAt: now.Add(-time.Hour),
+		Result:    &solver.Remote{Descriptors: []ocispecs.Descriptor{{Digest: dgst("old")}}},
+	}}
+	for i := range 20 {
+		results = append(results, solver.CacheExportResult{
+			CreatedAt: now,
+			Result: &solver.Remote{
+				Descriptors: []ocispecs.Descriptor{{Digest: dgst(fmt.Sprintf("blob%d", i))}},
+			},
+		})
+	}
+
+	cc := NewCacheChains()
+	_, _, err := cc.Add(outputKey(dgst("foo"), 0), nil, results)
+	require.NoError(t, err)
+
+	cfg, _, err := cc.Marshal(t.Context())
+	require.NoError(t, err)
+	require.Len(t, cfg.Layers, 1)
+	require.Equal(t, dgst("blob0"), cfg.Layers[0].Blob, "results with equal CreatedAt must keep the order they were added in")
 }
 
 func dgst(s string) digest.Digest {
