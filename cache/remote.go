@@ -93,7 +93,11 @@ func appendRemote(parents []*solver.Remote, desc ocispecs.Descriptor, p content.
 		provider := contentutil.NewMultiProvider(pRemote.Provider)
 		provider.Add(desc.Digest, p)
 		res = append(res, &solver.Remote{
-			Descriptors: append(pRemote.Descriptors, desc),
+			// Copy the parent descriptors. Appending to pRemote.Descriptors in place
+			// would share its backing array between all children of pRemote whenever
+			// it has spare capacity, and the next variant appended here would
+			// overwrite the last descriptor of this one.
+			Descriptors: append(slices.Clip(pRemote.Descriptors), desc),
 			Provider:    provider,
 		})
 	}

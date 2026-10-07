@@ -100,7 +100,7 @@ func (s *prepareLabelSnapshotter) getSnapshotRef() string {
 	return s.snapshotRef
 }
 
-func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, cleanup func(), err error) {
+func newCacheManager(ctx context.Context, t testing.TB, opt cmOpt) (co *cmOut, cleanup func(), err error) {
 	ns, ok := namespaces.Namespace(ctx)
 	if !ok {
 		return nil, nil, errors.New("namespace required for test")
@@ -2414,6 +2414,81 @@ func checkVariantsCoverage(ctx context.Context, t *testing.T, variants idxToVari
 		delete(got, d.Digest)
 	}
 	require.Equal(t, 0, len(got))
+}
+
+// newCompressionVariantChain creates a chain of depth refs. The main blob of
+// every layer is gzip and has a linked zstd variant, which is what the content
+// store looks like after a build was exported once with gzip and once with
+// zstd,force-compression=true. The blobs are written directly to the content
+// store, so the refs are not lazy and nothing is extracted.
+func newCompressionVariantChain(ctx context.Context, t testing.TB, co *cmOut, depth int) (refs []ImmutableRef, gzipDescs, zstdDescs []ocispecs.Descriptor) {
+	writeBlob := func(dt []byte, desc ocispecs.Descriptor) {
+		require.NoError(t, content.WriteBlob(ctx, co.cs, desc.Digest.String(), bytes.NewReader(dt), desc))
+	}
+	var parent ImmutableRef
+	for i := range depth {
+		m := map[string]string{"foo": strconv.Itoa(i)}
+		gzipBytes, gzipDesc, err := mapToBlob(m, true)
+		require.NoError(t, err)
+		writeBlob(gzipBytes, gzipDesc)
+		zstdBytes, zstdDesc, err := mapToBlobWithCompression(m, func(w io.Writer) (io.WriteCloser, string, error) {
+			zw, err := zstd.NewWriter(w)
+			return zw, ocispecs.MediaTypeImageLayerZstd, err
+		})
+		require.NoError(t, err)
+		writeBlob(zstdBytes, zstdDesc)
+
+		ref, err := co.manager.GetByBlob(ctx, gzipDesc, parent)
+		require.NoError(t, err)
+		t.Cleanup(func() { ref.Release(context.WithoutCancel(ctx)) })
+		require.NoError(t, ref.(*immutableRef).linkBlob(ctx, zstdDesc))
+
+		refs = append(refs, ref)
+		gzipDescs = append(gzipDescs, gzipDesc)
+		zstdDescs = append(zstdDescs, zstdDesc)
+		parent = ref
+	}
+	return refs, gzipDescs, zstdDescs
+}
+
+// TestGetRemotesCompressionVariantChain checks GetRemotes(all=true) on a chain
+// where every layer has two compression variants. The 2-layer chain in
+// TestGetRemotes is too short to show problems that only appear once the
+// descriptor slices have spare capacity.
+func TestGetRemotesCompressionVariantChain(t *testing.T) {
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+
+	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
+	require.NoError(t, err)
+	t.Cleanup(func() { done(context.WithoutCancel(ctx)) })
+
+	const depth = 6
+	refs, gzipDescs, zstdDescs := newCompressionVariantChain(ctx, t, co, depth)
+
+	remotes, err := refs[depth-1].GetRemotes(ctx, false, config.RefConfig{Compression: compression.New(compression.Gzip)}, true, nil)
+	require.NoError(t, err)
+	require.Len(t, remotes, 1+1<<(depth-1))
+
+	// Every variant must be a real combination of the per-layer blobs, with
+	// the topmost blob in the requested compression, and no combination may
+	// be listed twice.
+	seen := map[string]struct{}{}
+	for _, r := range remotes[1:] {
+		require.Len(t, r.Descriptors, depth)
+		var key []string
+		for i, desc := range r.Descriptors {
+			require.Contains(t, []digest.Digest{gzipDescs[i].Digest, zstdDescs[i].Digest}, desc.Digest, "layer %d", i)
+			key = append(key, desc.Digest.String())
+		}
+		require.Equal(t, gzipDescs[depth-1].Digest, r.Descriptors[depth-1].Digest)
+		seen[strings.Join(key, ",")] = struct{}{}
+	}
+	require.Equal(t, 1<<(depth-1), len(seen), "every parent combination must appear exactly once")
 }
 
 // Make sure that media type and urls are persisted for non-distributable blobs.
