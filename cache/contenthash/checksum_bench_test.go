@@ -140,6 +140,49 @@ func BenchmarkChecksumCold(b *testing.B) {
 	}
 }
 
+// BenchmarkChecksumSubdir measures the first checksum of a small directory
+// next to a large one, like COPY --from=stage /app/dist from a stage whose
+// rootfs or /app also holds node_modules. entries/op is the number of
+// filesystem entries scanned.
+func BenchmarkChecksumSubdir(b *testing.B) {
+	ref := benchRef(b, func(root string) error {
+		for i := range 20000 {
+			dir := filepath.Join(root, "app", "node_modules", fmt.Sprintf("m%03d", i%200))
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%05d.js", i)), []byte("x"), 0644); err != nil {
+				return err
+			}
+		}
+		if err := os.MkdirAll(filepath.Join(root, "app", "dist"), 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(root, "app", "dist", "main.js"), []byte("main"), 0644)
+	})
+	for _, tc := range []struct {
+		name string
+		path string
+		opts ChecksumOpts
+	}{
+		{"path", "/app/dist", ChecksumOpts{}},
+		{"wildcard", "/app/dist/*.js", ChecksumOpts{Wildcard: true}},
+		{"exclude", "/app/dist", ChecksumOpts{ExcludePatterns: []string{"*.map"}}},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			scanCounterEnable = true
+			defer func() { scanCounterEnable = false }()
+			start := scanCounter.Load()
+			for b.Loop() {
+				cc := benchCacheContext(ref)
+				_, err := cc.Checksum(b.Context(), ref, tc.path, tc.opts, nil)
+				require.NoError(b, err)
+			}
+			b.ReportMetric(float64(scanCounter.Load()-start)/float64(b.N), "entries/op")
+		})
+	}
+}
+
 func benchRef(b *testing.B, fn func(root string) error) cache.ImmutableRef {
 	tmpdir := b.TempDir()
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))

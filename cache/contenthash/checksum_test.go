@@ -66,14 +66,14 @@ func TestChecksumSymlinkNoParentScan(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	// The above checksum request should have only checksummed aa/bb/cc, and so
-	// any parent directories should need a scan but non-existent (or existent)
-	// children should not.
+	// The above checksum request should have only scanned aa/bb/cc/dd, and so
+	// any parent directories and siblings should need a scan but paths below
+	// it should not.
 	root := cc.tree.Root()
 
 	for _, path := range []string{
-		// Paths not within the scanned /aa/bb/cc/.
-		"/", "/aa", "/aa/bb", "/aa/bb/ff", "/non-exist",
+		// Paths not within the scanned /aa/bb/cc/dd.
+		"/", "/aa", "/aa/bb", "/aa/bb/ff", "/non-exist", "/aa/bb/cc", "/aa/bb/cc/non-exist",
 	} {
 		needs1, err := cc.needsScan(root, path, false)
 		require.NoErrorf(t, err, "needsScan(%q, followTrailing=false)", path)
@@ -85,8 +85,8 @@ func TestChecksumSymlinkNoParentScan(t *testing.T) {
 	}
 
 	for _, path := range []string{
-		// Paths within the scanned /aa/bb/cc, even if they don't exist.
-		"/aa/bb/cc", "/aa/bb/cc/non-exist", "/aa/bb/cc/dd/ee/ff", "/aa/bb/cc/non-exist/xx/yy/zz",
+		// Paths within the scanned /aa/bb/cc/dd, even if they don't exist.
+		"/aa/bb/cc/dd", "/aa/bb/cc/dd/ee/ff",
 	} {
 		needs1, err := cc.needsScan(root, path, false)
 		require.NoErrorf(t, err, "needsScan(%q, followTrailing=false)", path)
@@ -139,7 +139,8 @@ func TestNeedScanChecksumRegression(t *testing.T) {
 	cc, err := newCacheContext(ref)
 	require.NoError(t, err)
 
-	// Checksumming /aa/bb while following links will result in /aa being scanned.
+	// Checksumming /bb while following links will result in only /aa/bb
+	// being scanned.
 	_, err = cc.Checksum(t.Context(), ref, "/bb", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
@@ -148,20 +149,21 @@ func TestNeedScanChecksumRegression(t *testing.T) {
 		path                            string
 		followTrailing, expectNeedsScan bool
 	}{
-		// Any path under /aa will not result in a re-scan.
-		{"/aa", true, false},
-		{"/aa/ln", true, false},
-		{"/aa/ln", false, false},
-		{"/aa/non-exist", true, false},
+		// Any path under /aa/bb will not result in a re-scan.
+		{"/aa/bb", true, false},
 		{"/aa/bb/non-exist", true, false},
 		{"/aa/bb/cc", true, false},
 		{"/aa/bb/cc/non-exist", true, false},
-		// followTrailing=false on a symlink to /.
-		{"/aa/root", false, false},
 		// /bb itself was scanned during the lookup in Checksum.
 		{"/bb", true, false},
 		{"/bb", false, false},
-		// A path outside /aa will need a scan.
+		{"/bb/cc", true, false},
+		// A path outside /aa/bb will need a scan.
+		{"/aa", true, true},
+		{"/aa/ln", true, true},
+		{"/aa/ln", false, true},
+		{"/aa/non-exist", true, true},
+		{"/aa/root", false, true},
 		{"/non-exist", true, true},
 		{"/non-exist", false, true},
 		{"/aa/root", true, true},
@@ -181,13 +183,25 @@ func TestNeedScanChecksumRegression(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, initialScanCounter, scanCounter.Load())
 
-	// Looking up a non-existent path in / will checksum the whole tree. See
-	// <https://github.com/moby/buildkit/issues/5042> for more information.
-	// This means that needsScan will return true for any path.
-	_, err = cc.Checksum(t.Context(), ref, "/non-existent", ChecksumOpts{FollowLinks: true}, nil)
-	require.Error(t, err)
+	// Looking up a non-existent path only looks at that path, not at the
+	// whole tree. See <https://github.com/moby/buildkit/issues/5042>, where
+	// repeated lookups of a missing path rescanned the whole tree each time.
+	for _, path := range []string{"/non-existent", "/non-existent", "/different/non/existent", "/aa/root/aa/non-exist"} {
+		before := scanCounter.Load()
+		_, err = cc.Checksum(t.Context(), ref, path, ChecksumOpts{FollowLinks: true}, nil)
+		require.Errorf(t, err, "Checksum(%q)", path)
+		require.LessOrEqualf(t, scanCounter.Load()-before, uint64(1), "Checksum(%q)", path)
+	}
+	// /aa/root/bb/cc resolves to /bb/cc, which is /aa/bb/cc and already scanned.
+	before := scanCounter.Load()
+	_, err = cc.Checksum(t.Context(), ref, "/aa/root/bb/cc", ChecksumOpts{FollowLinks: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, before, scanCounter.Load())
+
+	// Once the root has been scanned, no lookup needs another scan.
+	_, err = cc.Checksum(t.Context(), ref, "/", ChecksumOpts{FollowLinks: true}, nil)
+	require.NoError(t, err)
 	fullScanCounter := scanCounter.Load()
-	require.NotEqual(t, fullScanCounter, initialScanCounter)
 
 	root = cc.tree.Root()
 	for _, path := range []string{

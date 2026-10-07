@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	cerrdefs "github.com/containerd/errdefs"
 	iradix "github.com/hashicorp/go-immutable-radix/v2"
@@ -474,13 +475,25 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 		cc.commitActiveTransaction()
 	}
 
+	// Only the subtree the walk below starts from needs to be scanned: for
+	// wildcards, the part of the path before the first wildcard, resolved
+	// like wildcardPrefix does.
+	scanRoot, scanFollow := keyPath(p), false
+	if opts.Wildcard {
+		d1, d2 := splitWildcards(scanRoot)
+		scanRoot, scanFollow = keyPath(d1), d2 != ""
+	}
 	root := cc.tree.Root()
-	scan, err := cc.needsScan(root, "", false)
+	scan, err := cc.needsScan(root, scanRoot, scanFollow)
 	if err != nil {
 		return "", nil, err
 	}
 	if scan {
-		if err := cc.scanPath(ctx, m, "", false); err != nil {
+		// A component of scanRoot that is not a directory means that nothing
+		// below it exists. The walk below then matches nothing, as it did
+		// when the whole tree was scanned from the root, so this is not an
+		// error.
+		if err := cc.scanPath(ctx, m, scanRoot, scanFollow); err != nil && !errors.Is(err, syscall.ENOTDIR) {
 			return "", nil, err
 		}
 	}
@@ -1081,12 +1094,10 @@ func (cc *cacheContext) scanPath(ctx context.Context, m *mount, p string, follow
 		return err
 	}
 
-	// Scan the parent directory of the path we resolved, unless we're at the
-	// root (in which case we scan the root).
-	scanPath := filepath.Dir(resolvedPath)
-	if !strings.HasPrefix(filepath.ToSlash(scanPath)+"/", filepath.ToSlash(mp)+"/") {
-		scanPath = resolvedPath
-	}
+	// Scan the path we resolved and everything below it. Its parent is not
+	// scanned: needsScan only skips a scan for paths below a non-symlink
+	// record, and every such record has its whole subtree in the tree.
+	scanPath := resolvedPath
 
 	walkFunc := func(itemPath string, fi os.FileInfo, err error) error {
 		if scanCounterEnable {
