@@ -501,6 +501,9 @@ buildctl build ... \
 * `compression-level=<value>`: choose compression level for gzip, estargz (0-9) and zstd (0-22)
 * `force-compression=true`: forcibly apply `compression` option to all layers
 * `ignore-error=<false|true>`: specify if error is ignored in case cache export fails (default: `false`)
+* `merge=<false|true>`: keep the records of the cache currently at `ref` that this build did not export, so that builds of different targets or platforms sharing one `ref` stop evicting each other's cache (default: `false`, experimental)
+* `merge-max-size=<bytes>`: with `merge=true`, drop the oldest kept records until the cache config fits in this many bytes (default: `524288`, at most `1048576`, the largest config an importer reads)
+* `merge-max-age=<duration>`: with `merge=true`, drop kept records whose newest result is older than this, e.g. `168h` (default: no limit)
 
 `--import-cache` options:
 * `type=registry`

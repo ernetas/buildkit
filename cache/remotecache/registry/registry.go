@@ -4,14 +4,17 @@ import (
 	"context"
 	"maps"
 	"strconv"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/snapshotters"
+	cerrdefs "github.com/containerd/errdefs"
 
 	"github.com/distribution/reference"
 	"github.com/moby/buildkit/cache/remotecache"
+	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/contentutil"
@@ -42,6 +45,14 @@ const (
 	attrImageManifest = "image-manifest"
 	attrOCIMediatypes = "oci-mediatypes"
 	attrInsecure      = "registry.insecure"
+	attrMerge         = "merge"
+	attrMergeMaxAge   = "merge-max-age"
+	attrMergeMaxSize  = "merge-max-size"
+
+	// maxConfigSize is the largest cache config an importer reads.
+	maxConfigSize = 1 << 20
+	// defaultMergeMaxSize leaves headroom below maxConfigSize.
+	defaultMergeMaxSize = maxConfigSize / 2
 )
 
 type exporter struct {
@@ -92,12 +103,72 @@ func ResolveCacheExporterFunc(sm *session.Manager, hosts docker.RegistryHosts) r
 
 		scope, hosts := registryConfig(hosts, ref, resolver.ScopeType{Push: true}, insecure)
 		remote := resolver.DefaultPool.GetResolver(hosts, refString, scope, sm, g)
+		var opts []remotecache.ExporterOpt
+		mergeOpt, merge, err := parseMergeAttrs(attrs)
+		if err != nil {
+			return nil, err
+		}
+		if merge {
+			opts = append(opts, remotecache.WithMerge(&registryMergeSource{resolver: remote, ref: refString}, mergeOpt))
+		}
 		pusher, err := push.Pusher(ctx, remote, refString)
 		if err != nil {
 			return nil, err
 		}
-		return &exporter{remotecache.NewExporter(contentutil.FromPusher(pusher), refString, ociMediatypes, imageManifest, compressionConfig)}, nil
+		return &exporter{remotecache.NewExporter(contentutil.FromPusher(pusher), refString, ociMediatypes, imageManifest, compressionConfig, opts...)}, nil
 	}
+}
+
+func parseMergeAttrs(attrs map[string]string) (v1.MergeOpt, bool, error) {
+	opt := v1.MergeOpt{MaxConfigSize: defaultMergeMaxSize}
+	v, ok := attrs[attrMerge]
+	if !ok {
+		return opt, false, nil
+	}
+	merge, err := strconv.ParseBool(v)
+	if err != nil {
+		return opt, false, errors.Wrapf(err, "failed to parse %s", attrMerge)
+	}
+	if v, ok := attrs[attrMergeMaxAge]; ok {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return opt, false, errors.Wrapf(err, "failed to parse %s", attrMergeMaxAge)
+		}
+		opt.MaxAge = d
+	}
+	if v, ok := attrs[attrMergeMaxSize]; ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return opt, false, errors.Wrapf(err, "failed to parse %s", attrMergeMaxSize)
+		}
+		if n <= 0 || n > maxConfigSize {
+			return opt, false, errors.Errorf("%s must be between 1 and %d, the largest cache config importers accept", attrMergeMaxSize, maxConfigSize)
+		}
+		opt.MaxConfigSize = n
+	}
+	return opt, merge, nil
+}
+
+// registryMergeSource reads the cache currently at ref, through the
+// resolver the export pushes with.
+type registryMergeSource struct {
+	resolver *resolver.Resolver
+	ref      string
+}
+
+func (s *registryMergeSource) Resolve(ctx context.Context) (ocispecs.Descriptor, content.Provider, error) {
+	name, desc, err := s.resolver.Resolve(ctx, s.ref)
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return ocispecs.Descriptor{}, nil, nil
+		}
+		return ocispecs.Descriptor{}, nil, err
+	}
+	fetcher, err := s.resolver.Fetcher(ctx, name)
+	if err != nil {
+		return ocispecs.Descriptor{}, nil, err
+	}
+	return desc, contentutil.FromFetcher(limited.Default.WrapFetcher(fetcher, s.ref)), nil
 }
 
 func ResolveCacheImporterFunc(sm *session.Manager, cs content.Store, hosts docker.RegistryHosts) remotecache.ResolveCacheImporterFunc {

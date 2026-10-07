@@ -128,3 +128,33 @@ func waitForSessionRemoval(t *testing.T, sm *session.Manager, id string) {
 		return err == nil && caller == nil
 	}, time.Second, 10*time.Millisecond)
 }
+
+func TestParseMergeAttrs(t *testing.T) {
+	for _, tc := range []struct {
+		attrs map[string]string
+		merge bool
+		opt   cacheimport.MergeOpt
+		err   bool
+	}{
+		{attrs: map[string]string{}, opt: cacheimport.MergeOpt{MaxConfigSize: defaultMergeMaxSize}},
+		{attrs: map[string]string{"merge": "false"}, opt: cacheimport.MergeOpt{MaxConfigSize: defaultMergeMaxSize}},
+		{attrs: map[string]string{"merge": "true"}, merge: true, opt: cacheimport.MergeOpt{MaxConfigSize: defaultMergeMaxSize}},
+		{
+			attrs: map[string]string{"merge": "true", "merge-max-age": "168h", "merge-max-size": "100000"},
+			merge: true,
+			opt:   cacheimport.MergeOpt{MaxConfigSize: 100000, MaxAge: 168 * time.Hour},
+		},
+		{attrs: map[string]string{"merge": "yes"}, err: true},
+		{attrs: map[string]string{"merge": "true", "merge-max-age": "7"}, err: true},
+		{attrs: map[string]string{"merge": "true", "merge-max-size": "2000000"}, err: true},
+	} {
+		opt, merge, err := parseMergeAttrs(tc.attrs)
+		if tc.err {
+			require.Error(t, err, "%v", tc.attrs)
+			continue
+		}
+		require.NoError(t, err, "%v", tc.attrs)
+		require.Equal(t, tc.merge, merge, "%v", tc.attrs)
+		require.Equal(t, tc.opt, opt, "%v", tc.attrs)
+	}
+}

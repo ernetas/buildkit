@@ -160,10 +160,10 @@ func (c *CacheChains) Add(dgst digest.Digest, deps [][]solver.CacheLink, results
 		}, map[*item]struct{}{}); err != nil {
 			return nil, false, errors.Wrapf(err, "failed to walk children of %s", dgst)
 		}
-		for i, dd := range deps {
+		for _, dd := range deps {
 			for j, d := range dd {
 				if _, ok := allChildren[d.Src.(*item)]; ok {
-					deps[i][j].Src = nil
+					dd[j].Src = nil
 				}
 			}
 		}

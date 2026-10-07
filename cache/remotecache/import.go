@@ -51,53 +51,13 @@ func (ci *contentCacheImporter) Resolve(ctx context.Context, desc ocispecs.Descr
 		return nil, err
 	}
 
-	manifestType, err := imageutil.DetectManifestBlobMediaType(dt)
+	manifestType, configDesc, allLayers, err := parseCacheManifest(dt, ci.provider)
 	if err != nil {
 		return nil, err
 	}
 
 	layerDone := progress.OneOff(ctx, fmt.Sprintf("inferred cache manifest type: %s", manifestType))
 	layerDone(nil)
-
-	allLayers := v1.DescriptorProvider{}
-	var configDesc ocispecs.Descriptor
-
-	switch manifestType {
-	case images.MediaTypeDockerSchema2ManifestList, ocispecs.MediaTypeImageIndex:
-		var mfst ocispecs.Index
-		if err := json.Unmarshal(dt, &mfst); err != nil {
-			return nil, err
-		}
-
-		for _, m := range mfst.Manifests {
-			if m.MediaType == cacheimporttypes.CacheConfigMediaTypeV0 {
-				configDesc = m
-				continue
-			}
-			allLayers[m.Digest] = v1.DescriptorProviderPair{
-				Descriptor: m,
-				Provider:   ci.provider,
-			}
-		}
-	case images.MediaTypeDockerSchema2Manifest, ocispecs.MediaTypeImageManifest:
-		var mfst ocispecs.Manifest
-		if err := json.Unmarshal(dt, &mfst); err != nil {
-			return nil, err
-		}
-
-		if mfst.Config.MediaType == cacheimporttypes.CacheConfigMediaTypeV0 {
-			configDesc = mfst.Config
-		}
-		for _, m := range mfst.Layers {
-			allLayers[m.Digest] = v1.DescriptorProviderPair{
-				Descriptor: m,
-				Provider:   ci.provider,
-			}
-		}
-	default:
-		err = errors.Wrapf(err, "unsupported or uninferrable manifest type")
-		return nil, err
-	}
 
 	if dsls, ok := ci.provider.(DistributionSourceLabelSetter); ok {
 		for dgst, l := range allLayers {
@@ -127,6 +87,56 @@ func (ci *contentCacheImporter) Resolve(ctx context.Context, desc ocispecs.Descr
 		return nil, err
 	}
 	return solver.NewCacheManager(ctx, id, keysStorage, resultStorage), nil
+}
+
+// parseCacheManifest returns the type of a cache manifest or index, the
+// descriptor of its cache config and its layer blobs. The config descriptor
+// is empty for an image, which may carry an inline cache instead.
+func parseCacheManifest(dt []byte, provider content.Provider) (string, ocispecs.Descriptor, v1.DescriptorProvider, error) {
+	manifestType, err := imageutil.DetectManifestBlobMediaType(dt)
+	if err != nil {
+		return "", ocispecs.Descriptor{}, nil, err
+	}
+
+	allLayers := v1.DescriptorProvider{}
+	var configDesc ocispecs.Descriptor
+
+	switch manifestType {
+	case images.MediaTypeDockerSchema2ManifestList, ocispecs.MediaTypeImageIndex:
+		var mfst ocispecs.Index
+		if err := json.Unmarshal(dt, &mfst); err != nil {
+			return "", ocispecs.Descriptor{}, nil, err
+		}
+
+		for _, m := range mfst.Manifests {
+			if m.MediaType == cacheimporttypes.CacheConfigMediaTypeV0 {
+				configDesc = m
+				continue
+			}
+			allLayers[m.Digest] = v1.DescriptorProviderPair{
+				Descriptor: m,
+				Provider:   provider,
+			}
+		}
+	case images.MediaTypeDockerSchema2Manifest, ocispecs.MediaTypeImageManifest:
+		var mfst ocispecs.Manifest
+		if err := json.Unmarshal(dt, &mfst); err != nil {
+			return "", ocispecs.Descriptor{}, nil, err
+		}
+
+		if mfst.Config.MediaType == cacheimporttypes.CacheConfigMediaTypeV0 {
+			configDesc = mfst.Config
+		}
+		for _, m := range mfst.Layers {
+			allLayers[m.Digest] = v1.DescriptorProviderPair{
+				Descriptor: m,
+				Provider:   provider,
+			}
+		}
+	default:
+		return "", ocispecs.Descriptor{}, nil, errors.Errorf("unsupported or uninferrable manifest type %q", manifestType)
+	}
+	return manifestType, configDesc, allLayers, nil
 }
 
 func readBlob(ctx context.Context, provider content.Provider, desc ocispecs.Descriptor) ([]byte, error) {

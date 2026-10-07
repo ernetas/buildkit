@@ -68,9 +68,24 @@ func (data CacheType) String() string {
 	}
 }
 
-func NewExporter(ingester content.Ingester, ref string, oci bool, imageManifest bool, compressionConfig compression.Config) Exporter {
+// ExporterOpt configures an Exporter created by NewExporter.
+type ExporterOpt func(*contentCacheExporter)
+
+// WithMerge makes the exporter merge the cache it is about to replace, read
+// from src, into the exported cache, within the bounds of opt. See v1.Merge.
+func WithMerge(src MergeSource, opt v1.MergeOpt) ExporterOpt {
+	return func(ce *contentCacheExporter) {
+		ce.merge = &mergeConfig{src: src, opt: opt}
+	}
+}
+
+func NewExporter(ingester content.Ingester, ref string, oci bool, imageManifest bool, compressionConfig compression.Config, opts ...ExporterOpt) Exporter {
 	cc := v1.NewCacheChains()
-	return &contentCacheExporter{CacheExporterTarget: cc, chains: cc, ingester: ingester, oci: oci, imageManifest: imageManifest, ref: ref, comp: compressionConfig}
+	ce := &contentCacheExporter{CacheExporterTarget: cc, chains: cc, ingester: ingester, oci: oci, imageManifest: imageManifest, ref: ref, comp: compressionConfig}
+	for _, opt := range opts {
+		opt(ce)
+	}
+	return ce
 }
 
 type ExportableCache struct {
@@ -172,6 +187,7 @@ type contentCacheExporter struct {
 	imageManifest bool
 	ref           string
 	comp          compression.Config
+	merge         *mergeConfig
 }
 
 func (ce *contentCacheExporter) Name() string {
@@ -194,6 +210,10 @@ func (ce *contentCacheExporter) Finalize(ctx context.Context) (map[string]string
 	if len(config.Layers) == 0 {
 		bklog.G(ctx).Warn("failed to match any cache with layers")
 		return nil, progress.OneOff(ctx, "skipping cache export for empty result")(nil)
+	}
+
+	if ce.merge != nil {
+		config, descs = ce.merge.mergePrevious(ctx, config, descs)
 	}
 
 	cache, err := NewExportableCache(ce.oci, ce.imageManifest)
