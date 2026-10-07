@@ -14,7 +14,6 @@ import (
 	"github.com/moby/buildkit/cache/config"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
-	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/leaseutil"
@@ -53,104 +52,34 @@ func (sr *immutableRef) GetRemotes(ctx context.Context, createIfNeeded bool, ref
 		return []*solver.Remote{remote}, nil // early return if compression variants aren't required
 	}
 
-	// Search all available remotes that has the topmost blob with the specified
-	// compression with all combination of compressions
-	res := []*solver.Remote{remote}
-	topmost, parentChain := remote.Descriptors[len(remote.Descriptors)-1], remote.Descriptors[:len(remote.Descriptors)-1]
-	vDesc, err := getBlobWithCompression(ctx, sr.cm.ContentStore, topmost, refCfg.Compression.Type)
-	if err != nil {
-		return res, nil // compression variant doesn't exist. return the main blob only.
+	if refCfg.Compression.Type == nil {
+		return []*solver.Remote{remote}, nil // no compression to look for a variant of
 	}
 
-	var variants []*solver.Remote
-	if len(parentChain) == 0 {
-		variants = append(variants, &solver.Remote{
-			Descriptors: []ocispecs.Descriptor{vDesc},
-			Provider:    sr.cm.ContentStore,
-		})
-	} else {
-		// get parents with all combination of all available compressions.
-		parents, err := getAvailableBlobs(ctx, sr.cm.ContentStore, &solver.Remote{
-			Descriptors: parentChain,
-			Provider:    remote.Provider,
-		})
-		if err != nil {
-			return nil, err
-		}
-		variants = appendRemote(parents, vDesc, sr.cm.ContentStore)
-	}
-
-	// Return the main remote and all its compression variants.
+	// Add the main remote with its topmost blob replaced by the variant in the
+	// requested compression, if there is one. Only the topmost blob changes, so
+	// the parents keep the main remote's descriptors and provider.
+	//
+	// This used to return every per-layer combination of variants: 2^(n-1)
+	// remotes for an n-layer chain whose layers all have two variants. The
+	// remote cache exporters keep one result per record (bestResult in
+	// cache/remotecache/v1), and the first of those combinations is this one.
+	//
 	// NOTE: Because compressionopt is applied only to *newly created layers* in the main remote (i.e. res[0]),
 	//       it's possible that the main remote doesn't contain any blobs of the compressionopt.Type.
-	//       The topmost blob of the variants (res[1:]) is guaranteed to be the compressionopt.Type.
-	res = append(res, variants...)
-	return res, nil
-}
-
-func appendRemote(parents []*solver.Remote, desc ocispecs.Descriptor, p content.InfoReaderProvider) (res []*solver.Remote) {
-	for _, pRemote := range parents {
-		provider := contentutil.NewMultiProvider(pRemote.Provider)
-		provider.Add(desc.Digest, p)
-		res = append(res, &solver.Remote{
-			// Copy the parent descriptors. Appending to pRemote.Descriptors in place
-			// would share its backing array between all children of pRemote whenever
-			// it has spare capacity, and the next variant appended here would
-			// overwrite the last descriptor of this one.
-			Descriptors: append(slices.Clip(pRemote.Descriptors), desc),
-			Provider:    provider,
-		})
+	//       The topmost blob of the variant (res[1]) is guaranteed to be the compressionopt.Type.
+	topmost := remote.Descriptors[len(remote.Descriptors)-1]
+	vDesc, err := getBlobWithCompression(ctx, sr.cm.ContentStore, topmost, refCfg.Compression.Type)
+	if err != nil || vDesc.Digest == topmost.Digest {
+		return []*solver.Remote{remote}, nil // no variant, or the main remote already has it on top
 	}
-	return
-}
-
-func getAvailableBlobs(ctx context.Context, cs content.Store, chain *solver.Remote) ([]*solver.Remote, error) {
-	if len(chain.Descriptors) == 0 {
-		return nil, nil
+	provider := contentutil.NewMultiProvider(remote.Provider)
+	provider.Add(vDesc.Digest, sr.cm.ContentStore)
+	variant := &solver.Remote{
+		Descriptors: append(slices.Clone(remote.Descriptors[:len(remote.Descriptors)-1]), vDesc),
+		Provider:    provider,
 	}
-	target, parentChain := chain.Descriptors[len(chain.Descriptors)-1], chain.Descriptors[:len(chain.Descriptors)-1]
-	parents, err := getAvailableBlobs(ctx, cs, &solver.Remote{
-		Descriptors: parentChain,
-		Provider:    chain.Provider,
-	})
-	if err != nil {
-		return nil, err
-	}
-	var descs []ocispecs.Descriptor
-	if err := walkBlob(ctx, cs, target, func(desc ocispecs.Descriptor) bool {
-		// Nothing prevents this function from being called multiple times for the same descriptor.
-		// So we need to make sure we don't add the same descriptor again.
-		// Looping over the list is preferable:
-		// 1. to avoid using a map, which don't preserve the order of descriptors,
-		// 2. descs will have a length the number of compression variants for a blob, which is usually very small
-		if !slices.ContainsFunc(descs, func(d ocispecs.Descriptor) bool {
-			return d.Digest == desc.Digest
-		}) {
-			descs = append(descs, desc)
-		}
-		return true
-	}); err != nil {
-		bklog.G(ctx).WithError(err).Warn("failed to walk variant blob") // is not a critical error at this moment.
-	}
-	var res []*solver.Remote
-	for _, desc := range descs {
-		if len(parents) == 0 { // bottommost ref
-			res = append(res, &solver.Remote{
-				Descriptors: []ocispecs.Descriptor{desc},
-				Provider:    cs,
-			})
-			continue
-		}
-		res = append(res, appendRemote(parents, desc, cs)...)
-	}
-	if len(res) == 0 {
-		// no available compression blobs for this blob. return the original blob.
-		if len(parents) == 0 { // bottommost ref
-			return []*solver.Remote{chain}, nil
-		}
-		return appendRemote(parents, target, chain.Provider), nil
-	}
-	return res, nil
+	return []*solver.Remote{remote, variant}, nil
 }
 
 func (sr *immutableRef) getRemote(ctx context.Context, createIfNeeded bool, refCfg config.RefConfig, s session.Group) (*solver.Remote, error) {

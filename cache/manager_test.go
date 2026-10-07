@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -2355,65 +2356,35 @@ func TestGetRemotes(t *testing.T) {
 					require.Equal(t, mainRemote.Descriptors[i].Digest, gotMain.Descriptors[i].Digest)
 				}
 
-				// Check all variants are covered
-				checkVariantsCoverage(egctx, t, variants, len(remotes[0].Descriptors)-1, gotVariants, &compressionType)
+				// Check the variant: the main remote with only its topmost blob
+				// in the requested compression, unless the main remote already
+				// has that blob on top.
+				topIdx := len(gotMain.Descriptors) - 1
+				want, ok := variants[topIdx][compressionType]
+				require.True(t, ok, "idx = %d, compression = %q", topIdx, compressionType)
+				if gotMain.Descriptors[topIdx].Digest == want.Digest {
+					require.Empty(t, gotVariants)
+					return nil
+				}
+				require.Len(t, gotVariants, 1)
+				variant := gotVariants[0]
+				require.Len(t, variant.Descriptors, len(gotMain.Descriptors))
+				require.Equal(t, want.Digest, variant.Descriptors[topIdx].Digest)
+				for i := range topIdx {
+					require.Equal(t, gotMain.Descriptors[i].Digest, variant.Descriptors[i].Digest)
+				}
+				ra, err := variant.Provider.ReaderAt(egctx, want)
+				require.NoError(t, err)
+				dgstr := digest.Canonical.Digester()
+				_, err = io.Copy(dgstr.Hash(), io.NewSectionReader(ra, 0, want.Size))
+				require.NoError(t, err)
+				require.NoError(t, ra.Close())
+				require.Equal(t, want.Digest, dgstr.Digest())
 				return nil
 			})
 		}
 	}
 	require.NoError(t, eg.Wait())
-}
-
-func checkVariantsCoverage(ctx context.Context, t *testing.T, variants idxToVariants, idx int, remotes []*solver.Remote, expectCompression *compression.Type) {
-	if idx < 0 {
-		for _, r := range remotes {
-			require.Equal(t, 0, len(r.Descriptors))
-		}
-		return
-	}
-
-	// check the contents of the topmost blob of each remote
-	got := make(map[digest.Digest][]*solver.Remote)
-	for _, r := range remotes {
-		require.Equal(t, len(r.Descriptors)-1, idx, "idx = %d", idx)
-
-		// record this variant
-		topmost, lower := r.Descriptors[idx], r.Descriptors[:idx]
-		got[topmost.Digest] = append(got[topmost.Digest], &solver.Remote{Descriptors: lower, Provider: r.Provider})
-
-		// check the contents
-		r, err := r.Provider.ReaderAt(ctx, topmost)
-		require.NoError(t, err)
-		dgstr := digest.Canonical.Digester()
-		_, err = io.Copy(dgstr.Hash(), io.NewSectionReader(r, 0, topmost.Size))
-		require.NoError(t, err)
-		require.NoError(t, r.Close())
-		require.Equal(t, dgstr.Digest(), topmost.Digest)
-	}
-
-	// check the lowers as well
-	eg, egctx := errgroup.WithContext(ctx)
-	for _, lowers := range got {
-		eg.Go(func() error {
-			checkVariantsCoverage(egctx, t, variants, idx-1, lowers, nil) // expect all compression variants
-			return nil
-		})
-	}
-	require.NoError(t, eg.Wait())
-
-	// check the coverage of the variants
-	targets := variants[idx]
-	if expectCompression != nil {
-		c, ok := variants[idx][*expectCompression]
-		require.True(t, ok, "idx = %d, compression = %q, variants = %+v, got = %+v", idx, *expectCompression, variants[idx], got)
-		targets = map[compression.Type]ocispecs.Descriptor{*expectCompression: c}
-	}
-	for c, d := range targets {
-		_, ok := got[d.Digest]
-		require.True(t, ok, "idx = %d, compression = %q, want = %+v, got = %+v", idx, c, d, got)
-		delete(got, d.Digest)
-	}
-	require.Equal(t, 0, len(got))
 }
 
 // newCompressionVariantChain creates a chain of depth refs. The main blob of
@@ -2452,9 +2423,8 @@ func newCompressionVariantChain(ctx context.Context, t testing.TB, co *cmOut, de
 }
 
 // TestGetRemotesCompressionVariantChain checks GetRemotes(all=true) on a chain
-// where every layer has two compression variants. The 2-layer chain in
-// TestGetRemotes is too short to show problems that only appear once the
-// descriptor slices have spare capacity.
+// where every layer has two compression variants. It must return the main
+// remote plus at most one variant, not every per-layer combination.
 func TestGetRemotesCompressionVariantChain(t *testing.T) {
 	t.Parallel()
 
@@ -2469,26 +2439,78 @@ func TestGetRemotesCompressionVariantChain(t *testing.T) {
 
 	const depth = 6
 	refs, gzipDescs, zstdDescs := newCompressionVariantChain(ctx, t, co, depth)
+	top := refs[depth-1]
 
-	remotes, err := refs[depth-1].GetRemotes(ctx, false, config.RefConfig{Compression: compression.New(compression.Gzip)}, true, nil)
-	require.NoError(t, err)
-	require.Len(t, remotes, 1+1<<(depth-1))
-
-	// Every variant must be a real combination of the per-layer blobs, with
-	// the topmost blob in the requested compression, and no combination may
-	// be listed twice.
-	seen := map[string]struct{}{}
-	for _, r := range remotes[1:] {
-		require.Len(t, r.Descriptors, depth)
-		var key []string
-		for i, desc := range r.Descriptors {
-			require.Contains(t, []digest.Digest{gzipDescs[i].Digest, zstdDescs[i].Digest}, desc.Digest, "layer %d", i)
-			key = append(key, desc.Digest.String())
+	digests := func(r *solver.Remote) (dgsts []digest.Digest) {
+		for _, desc := range r.Descriptors {
+			dgsts = append(dgsts, desc.Digest)
 		}
-		require.Equal(t, gzipDescs[depth-1].Digest, r.Descriptors[depth-1].Digest)
-		seen[strings.Join(key, ",")] = struct{}{}
+		return dgsts
 	}
-	require.Equal(t, 1<<(depth-1), len(seen), "every parent combination must appear exactly once")
+	var gzipChain []digest.Digest
+	for _, desc := range gzipDescs {
+		gzipChain = append(gzipChain, desc.Digest)
+	}
+
+	// The main remote already has the requested compression on top, so it is
+	// the only remote.
+	remotes, err := top.GetRemotes(ctx, false, config.RefConfig{Compression: compression.New(compression.Gzip)}, true, nil)
+	require.NoError(t, err)
+	require.Len(t, remotes, 1)
+	require.Equal(t, gzipChain, digests(remotes[0]))
+
+	// With zstd requested, the variant is the main remote with only the
+	// topmost blob swapped, and every blob can be read from its provider.
+	for range 2 { // the result must not depend on the call
+		remotes, err = top.GetRemotes(ctx, false, config.RefConfig{Compression: compression.New(compression.Zstd)}, true, nil)
+		require.NoError(t, err)
+		require.Len(t, remotes, 2)
+		require.Equal(t, gzipChain, digests(remotes[0]))
+		require.Equal(t, append(slices.Clone(gzipChain[:depth-1]), zstdDescs[depth-1].Digest), digests(remotes[1]))
+		for _, desc := range remotes[1].Descriptors {
+			dt, err := content.ReadBlob(ctx, remotes[1].Provider, desc)
+			require.NoError(t, err)
+			require.Equal(t, desc.Digest, digest.FromBytes(dt))
+		}
+	}
+
+	// A zero RefConfig has no compression to find a variant of.
+	remotes, err = top.GetRemotes(ctx, false, config.RefConfig{}, true, nil)
+	require.NoError(t, err)
+	require.Len(t, remotes, 1)
+}
+
+// BenchmarkGetRemotesCompressionVariants measures GetRemotes(all=true), which
+// a remote cache export calls for every record, on the topmost ref of a chain
+// where every layer has a gzip blob and a zstd variant.
+func BenchmarkGetRemotesCompressionVariants(b *testing.B) {
+	for _, depth := range []int{5, 10, 15, 20} {
+		b.Run(fmt.Sprintf("depth=%d", depth), func(b *testing.B) {
+			ctx := namespaces.WithNamespace(b.Context(), "buildkit-test")
+			co, cleanup, err := newCacheManager(ctx, b, cmOpt{})
+			require.NoError(b, err)
+			b.Cleanup(cleanup)
+
+			ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
+			require.NoError(b, err)
+			b.Cleanup(func() { done(context.WithoutCancel(ctx)) })
+
+			refs, _, _ := newCompressionVariantChain(ctx, b, co, depth)
+			top := refs[depth-1]
+			refCfg := config.RefConfig{Compression: compression.New(compression.Gzip)}
+
+			var n int
+			b.ReportAllocs()
+			for b.Loop() {
+				remotes, err := top.GetRemotes(ctx, false, refCfg, true, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				n = len(remotes)
+			}
+			b.ReportMetric(float64(n), "remotes/op")
+		})
+	}
 }
 
 // Make sure that media type and urls are persisted for non-distributable blobs.
