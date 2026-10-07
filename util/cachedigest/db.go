@@ -51,16 +51,25 @@ func (d *DB) Close() error {
 	return nil
 }
 
+// NewHash returns a Hash that records its input as debug frames when d is
+// backed by a database (--save-cache-debug). Without a database nothing is
+// recorded, so hashing costs the same as a plain sha256.
 func (d *DB) NewHash(typ Type) *Hash {
-	return &Hash{
+	h := &Hash{
 		h:   sha256.New(),
 		typ: typ,
-		db:  d,
 	}
+	if d.enabled() {
+		h.db = d
+	}
+	return h
 }
 
 func (d *DB) FromBytes(dt []byte, typ Type) (digest.Digest, error) {
 	dgst := digest.FromBytes(dt)
+	if !d.enabled() {
+		return dgst, nil
+	}
 	d.saveFrames(dgst.String(), []Frame{
 		{ID: FrameIDType, Data: []byte(string(typ))},
 		{ID: FrameIDData, Data: dt},
@@ -68,8 +77,12 @@ func (d *DB) FromBytes(dt []byte, typ Type) (digest.Digest, error) {
 	return dgst, nil
 }
 
+func (d *DB) enabled() bool {
+	return d != nil && d.db != nil
+}
+
 func (d *DB) saveFrames(key string, frames []Frame) {
-	if d.db == nil {
+	if !d.enabled() {
 		return
 	}
 
