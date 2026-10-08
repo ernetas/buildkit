@@ -101,6 +101,11 @@ var propagators = propagation.NewCompositeTextMapPropagator(propagation.TraceCon
 
 const telemetryShutdownTimeout = 5 * time.Second
 
+const (
+	minLayerFetchChunkSize = 64 << 10
+	maxLayerFetchChunkSize = 1 << 30
+)
+
 type workerInitializerOpt struct {
 	compaction     []compaction.Config
 	config         *config.Config
@@ -331,6 +336,22 @@ func main() {
 					return errors.Errorf("maxRegistryConcurrency must be greater than zero; set to %d in the configuration file", *v)
 				}
 				limited.SetMaxConcurrency(int64(*v))
+			}
+			if sc.LayerFetchParallelism != nil || sc.LayerFetchChunkSize != nil {
+				var fetch resolver.FetchConfig
+				if v := sc.LayerFetchParallelism; v != nil {
+					if *v <= 0 {
+						return errors.Errorf("layerFetchParallelism must be greater than zero; set to %d in the configuration file", *v)
+					}
+					fetch.Parallelism = *v
+				}
+				if v := sc.LayerFetchChunkSize; v != nil {
+					if v.Percentage != 0 || v.Bytes < minLayerFetchChunkSize || v.Bytes > maxLayerFetchChunkSize {
+						return errors.Errorf("layerFetchChunkSize must be between %d and %d bytes", minLayerFetchChunkSize, maxLayerFetchChunkSize)
+					}
+					fetch.ChunkSize = int(v.Bytes)
+				}
+				resolver.DefaultPool.SetFetchConfig(fetch)
 			}
 			if v := sc.SessionAuthTimeout; v != nil {
 				sessionauth.SessionAuthTimeout = v.Duration

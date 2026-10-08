@@ -248,6 +248,19 @@ provenanceEnvDir = "/etc/buildkit/provenance.d"
   # maxRegistryConcurrency sets the maximum number of concurrent connections
   # per registry. If unset, the default concurrency limit is used.
   maxRegistryConcurrency = 4
+  # layerFetchParallelism sets the number of concurrent HTTP range requests
+  # used to download a single blob that is larger than layerFetchChunkSize.
+  # It speeds up pulls when one connection is slower than the network, for
+  # example behind a CDN that limits each stream. Range requests for one blob
+  # are not counted against maxRegistryConcurrency, so up to
+  # maxRegistryConcurrency * layerFetchParallelism connections may be open to
+  # one registry, and chunks downloaded ahead of the reader are buffered in
+  # memory. If unset or 1 (the default), each blob is downloaded with a
+  # single request.
+  layerFetchParallelism = 4
+  # layerFetchChunkSize sets the size of each range request used when
+  # layerFetchParallelism is greater than 1. Defaults to "8MiB".
+  layerFetchChunkSize = "8MiB"
   # sessionAuthTimeout sets the timeout for daemon-side authentication
   # round-trips with the buildx client session (resolving credentials and
   # fetching auth tokens from the session). Can be a duration string

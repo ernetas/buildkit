@@ -11,6 +11,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/core/transfer"
 	cerrdefs "github.com/containerd/errdefs"
 	distreference "github.com/distribution/reference"
 	"github.com/moby/buildkit/session"
@@ -27,8 +28,55 @@ var DefaultPool = NewPool()
 
 // Pool is a cache of recently used resolvers
 type Pool struct {
-	mu sync.Mutex
-	m  map[string]*authHandlerNS
+	mu    sync.Mutex
+	m     map[string]*authHandlerNS
+	fetch FetchConfig
+}
+
+// FetchConfig controls how resolvers created by a Pool download blobs. The
+// zero value downloads every blob with a single request.
+//
+// With Parallelism > 1 the containerd fetcher splits a blob into ChunkSize
+// range requests and runs up to Parallelism of them at once. That helps when
+// a single connection is slower than the link, for example behind a CDN that
+// limits every stream, but it costs memory and connections: the requests for
+// one blob share the blob's slot in the limited package, every chunk that is
+// downloaded ahead of the reader is buffered in memory, and every chunk uses
+// a new connection because the fetcher asks for an open-ended range and
+// closes the response after ChunkSize bytes.
+type FetchConfig struct {
+	// Parallelism is the maximum number of concurrent range requests used to
+	// download a single blob. Values below 2 disable range requests.
+	Parallelism int
+	// ChunkSize is the size in bytes of each range request. Blobs no larger
+	// than one chunk use a single request. Zero means DefaultFetchChunkSize.
+	ChunkSize int
+}
+
+// DefaultFetchChunkSize is the range request size used when
+// FetchConfig.ChunkSize is not set.
+const DefaultFetchChunkSize = 8 << 20
+
+func (c FetchConfig) resolverOptions() []transfer.ImageResolverOption {
+	if c.Parallelism < 2 {
+		return nil
+	}
+	chunkSize := c.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = DefaultFetchChunkSize
+	}
+	return []transfer.ImageResolverOption{
+		transfer.WithMaxConcurrentDownloads(c.Parallelism),
+		transfer.WithConcurrentLayerFetchBuffer(chunkSize),
+	}
+}
+
+// SetFetchConfig sets the blob download settings for resolvers created
+// by the pool from now on.
+func (p *Pool) SetFetchConfig(c FetchConfig) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fetch = c
 }
 
 // NewPool creates a new pool for caching resolvers
@@ -115,10 +163,10 @@ func (p *Pool) GetResolver(hosts docker.RegistryHosts, ref string, scope ScopeTy
 		"cached": ok,
 	}).Debugf("checked for cached auth handler namespace")
 
-	return newResolver(hosts, h, sm, g)
+	return newResolver(hosts, h, sm, g, p.fetch)
 }
 
-func newResolver(hosts docker.RegistryHosts, handler *authHandlerNS, sm *session.Manager, g session.Group) *Resolver {
+func newResolver(hosts docker.RegistryHosts, handler *authHandlerNS, sm *session.Manager, g session.Group, fetch FetchConfig) *Resolver {
 	if hosts == nil {
 		hosts = docker.ConfigureDefaultRegistries(
 			docker.WithClient(newDefaultClient()),
@@ -133,13 +181,25 @@ func newResolver(hosts docker.RegistryHosts, handler *authHandlerNS, sm *session
 		g:       g,
 		handler: handler,
 		headers: headers,
+		fetch:   fetch,
 	}
-
-	r.Resolver = docker.NewResolver(docker.ResolverOptions{
-		Hosts:   r.HostsFunc,
-		Headers: headers,
-	})
+	r.Resolver = r.newDockerResolver()
 	return r
+}
+
+// newDockerResolver creates the containerd resolver that r wraps. It must be
+// called again whenever HostsFunc or the headers need to be rebound.
+func (r *Resolver) newDockerResolver() remotes.Resolver {
+	dr := docker.NewResolver(docker.ResolverOptions{
+		Hosts:   r.HostsFunc,
+		Headers: r.headers,
+	})
+	if opts := r.fetch.resolverOptions(); len(opts) > 0 {
+		if dro, ok := dr.(remotes.ResolverWithOptions); ok {
+			dro.SetOptions(opts...)
+		}
+	}
+	return dr
 }
 
 type ScopeType struct {
@@ -167,6 +227,7 @@ type Resolver struct {
 	g       session.Group
 	handler *authHandlerNS
 	auth    *dockerAuthorizer
+	fetch   FetchConfig
 
 	is   images.Store
 	mode ResolveMode
@@ -214,10 +275,9 @@ func (r *Resolver) WithSession(s session.Group) *Resolver {
 	r2 := *r
 	r2.auth = nil
 	r2.g = s
-	r2.Resolver = docker.NewResolver(docker.ResolverOptions{
-		Hosts:   r2.HostsFunc, // this refers to the newly-configured session so we need to recreate the resolver.
-		Headers: r2.headers.Clone(),
-	})
+	r2.headers = r.headers.Clone()
+	// HostsFunc refers to the newly-configured session so we need to recreate the resolver.
+	r2.Resolver = r2.newDockerResolver()
 	return &r2
 }
 

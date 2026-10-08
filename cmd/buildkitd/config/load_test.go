@@ -281,6 +281,20 @@ func TestLoadHistoryMaxEntries(t *testing.T) {
 	}
 }
 
+func TestLoadLayerFetch(t *testing.T) {
+	cfg, err := Load(bytes.NewBufferString("[system]\n"))
+	require.NoError(t, err)
+	require.Nil(t, cfg.System.LayerFetchParallelism)
+	require.Nil(t, cfg.System.LayerFetchChunkSize)
+
+	cfg, err = Load(bytes.NewBufferString("[system]\nlayerFetchParallelism = 4\nlayerFetchChunkSize = \"16MiB\"\n"))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.System.LayerFetchParallelism)
+	require.Equal(t, 4, *cfg.System.LayerFetchParallelism)
+	require.NotNil(t, cfg.System.LayerFetchChunkSize)
+	require.Equal(t, int64(16<<20), cfg.System.LayerFetchChunkSize.Bytes)
+}
+
 func TestLoadSessionAuthTimeout(t *testing.T) {
 	tests := []struct {
 		name    string

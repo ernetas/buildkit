@@ -117,6 +117,15 @@ type SystemConfig struct {
 	// connections per registry.
 	MaxRegistryConcurrency *int `toml:"maxRegistryConcurrency"`
 
+	// LayerFetchParallelism sets the number of concurrent HTTP range
+	// requests used to download a single blob from a registry. A value of
+	// 1 downloads each blob with a single request.
+	LayerFetchParallelism *int `toml:"layerFetchParallelism"`
+
+	// LayerFetchChunkSize sets the size of each range request used when
+	// LayerFetchParallelism is greater than 1.
+	LayerFetchChunkSize *DiskSpace `toml:"layerFetchChunkSize"`
+
 	// SessionAuthTimeout is the timeout for daemon-side session auth
 	// round-trips with the buildx client session. Defaults to 60 seconds.
 	// A value of zero or less disables the deadline entirely.
