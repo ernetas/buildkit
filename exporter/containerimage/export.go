@@ -20,6 +20,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/rootfs"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
+	distreference "github.com/distribution/reference"
 	"github.com/moby/buildkit/cache"
 	cacheconfig "github.com/moby/buildkit/cache/config"
 	"github.com/moby/buildkit/client"
@@ -30,6 +31,7 @@ import (
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/llbsolver/compat"
 	"github.com/moby/buildkit/solver/result"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/errutil"
@@ -254,7 +256,30 @@ func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source
 		}
 	}()
 
-	desc, committedRemotes, err := e.opt.ImageWriter.Commit(ctx, src, buildInfo.SessionID, buildInfo.InlineCache, &opts, buildInfo.CompatibilityVersion, e.Type())
+	// With push, upload every new layer as soon as it has been compressed,
+	// while the other layers are still being compressed. With
+	// rewrite-timestamp the pushed layers are the rewritten ones, which only
+	// exist after Commit.
+	commitCtx := ctx
+	var uploaders map[string]*push.BlobUploader
+	if e.push && !opts.RewriteTimestamp {
+		uploaders = e.newBlobUploaders(ctx, src, buildInfo.SessionID)
+		if len(uploaders) > 0 {
+			commitCtx = cache.WithBlobReadyFunc(ctx, func(desc ocispecs.Descriptor) {
+				for _, u := range uploaders {
+					u.Upload(desc)
+				}
+			})
+		}
+	}
+	finalizeUploaders := false
+	defer func() {
+		if !finalizeUploaders {
+			closeBlobUploaders(uploaders)
+		}
+	}()
+
+	desc, committedRemotes, err := e.opt.ImageWriter.Commit(commitCtx, src, buildInfo.SessionID, buildInfo.InlineCache, &opts, buildInfo.CompatibilityVersion, e.Type())
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -391,9 +416,11 @@ func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source
 	}
 
 	// Create finalize callback for pushing
+	finalizeUploaders = true
 	finalize := func(ctx context.Context) error {
+		defer closeBlobUploaders(uploaders)
 		for _, targetName := range namesToPush {
-			err := e.pushImage(ctx, src, buildInfo.SessionID, targetName, desc.Digest)
+			err := e.pushImage(ctx, src, buildInfo.SessionID, targetName, desc.Digest, uploaders[repositoryName(targetName)])
 			if err != nil {
 				var statusErr remoteserrors.ErrUnexpectedStatus
 				if errors.As(err, &statusErr) {
@@ -408,7 +435,54 @@ func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source
 	return resp, finalize, descref, nil
 }
 
-func (e *imageExporterInstance) pushImage(ctx context.Context, src *exporter.Source, sessionID string, targetName string, dgst digest.Digest) error {
+// newBlobUploaders returns a blob uploader for every repository that the
+// image will be pushed to.
+func (e *imageExporterInstance) newBlobUploaders(ctx context.Context, src *exporter.Source, sessionID string) map[string]*push.BlobUploader {
+	imageName := e.opts.ImageName
+	if n, ok := src.Metadata["image.name"]; imageName == "*" && ok {
+		imageName = string(n)
+	}
+	var names []string
+	if imageName != "" {
+		names = strings.Split(imageName, ",")
+	}
+	if e.danglingPrefix != "" && (!e.danglingEmptyOnly || imageName == "") {
+		names = append(names, e.danglingPrefix)
+	}
+	uploaders := map[string]*push.BlobUploader{}
+	for _, name := range names {
+		repo := repositoryName(name)
+		if _, ok := uploaders[repo]; ok || repo == "" {
+			continue
+		}
+		cs := e.opt.ImageWriter.ContentStore()
+		u, err := push.NewBlobUploader(ctx, e.opt.SessionManager, sessionID, cs, cs, name, e.insecure, e.opt.RegistryHosts)
+		if err != nil {
+			bklog.G(ctx).WithError(err).Debugf("not uploading layers to %s early", name)
+			continue
+		}
+		uploaders[repo] = u
+	}
+	return uploaders
+}
+
+func closeBlobUploaders(uploaders map[string]*push.BlobUploader) {
+	for _, u := range uploaders {
+		u.Close()
+	}
+}
+
+// repositoryName returns the normalized repository of an image name, or ""
+// if it is not a valid name.
+func repositoryName(name string) string {
+	parsed, err := distreference.ParseNormalizedNamed(name)
+	if err != nil {
+		return ""
+	}
+	return parsed.Name()
+}
+
+func (e *imageExporterInstance) pushImage(ctx context.Context, src *exporter.Source, sessionID string, targetName string, dgst digest.Digest, uploader *push.BlobUploader) error {
 	var refs []cache.ImmutableRef
 	if src.Ref != nil {
 		refs = append(refs, src.Ref)
@@ -433,7 +507,11 @@ func (e *imageExporterInstance) pushImage(ctx context.Context, src *exporter.Sou
 			addAnnotations(annotations, desc)
 		}
 	}
-	return push.Push(ctx, e.opt.SessionManager, sessionID, mprovider, e.opt.ImageWriter.ContentStore(), dgst, targetName, e.insecure, e.opt.RegistryHosts, e.pushByDigest, annotations)
+	var opts []push.Opt
+	if uploader != nil {
+		opts = append(opts, push.WithBlobUploader(uploader))
+	}
+	return push.Push(ctx, e.opt.SessionManager, sessionID, mprovider, e.opt.ImageWriter.ContentStore(), dgst, targetName, e.insecure, e.opt.RegistryHosts, e.pushByDigest, annotations, opts...)
 }
 
 func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Image, src *exporter.Source, remotes *result.Result[*solver.Remote]) (err0 error) {

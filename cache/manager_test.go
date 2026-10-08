@@ -2500,6 +2500,103 @@ func TestGetRemotesConcurrentCompression(t *testing.T) {
 	}
 }
 
+// TestGetRemotesBlobReadyFunc checks that GetRemotes reports every layer blob
+// it creates to the BlobReadyFunc in its context, with the descriptor that
+// ends up in the returned remote, and nothing else.
+func TestGetRemotesBlobReadyFunc(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS != "linux" {
+		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
+	}
+
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+
+	tmpdir := t.TempDir()
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager
+
+	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
+	require.NoError(t, err)
+	defer done(context.WithoutCancel(ctx))
+
+	newChain := func(name string) ImmutableRef {
+		var parent ImmutableRef
+		for i := range 3 {
+			mutRef, err := cm.New(ctx, parent, nil)
+			require.NoError(t, err)
+			m, err := mutRef.Mount(ctx, false, nil)
+			require.NoError(t, err)
+			lm := snapshot.LocalMounter(m)
+			target, err := lm.Mount()
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(target, fmt.Sprintf("%s-%d", name, i)), []byte(name), 0600))
+			require.NoError(t, lm.Unmount())
+			ref, err := mutRef.Commit(ctx)
+			require.NoError(t, err)
+			if parent != nil {
+				require.NoError(t, parent.Release(ctx))
+			}
+			parent = ref
+		}
+		return parent
+	}
+
+	var mu sync.Mutex
+	var ready []ocispecs.Descriptor
+	hookCtx := WithBlobReadyFunc(ctx, func(desc ocispecs.Descriptor) {
+		mu.Lock()
+		defer mu.Unlock()
+		ready = append(ready, desc)
+	})
+	takeReady := func() map[digest.Digest]ocispecs.Descriptor {
+		mu.Lock()
+		defer mu.Unlock()
+		m := map[digest.Digest]ocispecs.Descriptor{}
+		for _, desc := range ready {
+			_, dup := m[desc.Digest]
+			require.False(t, dup, "blob %s reported twice", desc.Digest)
+			m[desc.Digest] = desc
+		}
+		ready = nil
+		return m
+	}
+
+	for _, tc := range []struct {
+		name string
+		comp compression.Config
+	}{
+		{"gzip", compression.New(compression.Gzip)},
+		{"zstd-forced", compression.New(compression.Zstd).SetForce(true)},
+	} {
+		ref := newChain(tc.name)
+		remotes, err := ref.GetRemotes(hookCtx, true, config.RefConfig{Compression: tc.comp}, false, nil)
+		require.NoError(t, err)
+		require.Len(t, remotes, 1)
+		got := takeReady()
+		require.Len(t, got, len(remotes[0].Descriptors), tc.name)
+		for _, desc := range remotes[0].Descriptors {
+			require.Contains(t, got, desc.Digest, tc.name)
+			require.Equal(t, desc.MediaType, got[desc.Digest].MediaType, tc.name)
+			require.Equal(t, desc.Size, got[desc.Digest].Size, tc.name)
+		}
+
+		// The blobs exist now, so they are not reported again.
+		_, err = ref.GetRemotes(hookCtx, true, config.RefConfig{Compression: tc.comp}, false, nil)
+		require.NoError(t, err)
+		require.Empty(t, takeReady(), tc.name)
+		require.NoError(t, ref.Release(ctx))
+	}
+}
+
 // Make sure that media type and urls are persisted for non-distributable blobs.
 func TestNondistributableBlobs(t *testing.T) {
 	t.Parallel()

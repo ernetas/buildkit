@@ -352,6 +352,15 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 					return errors.Wrapf(err, "failed to ensure compression type of %q", comp.Type)
 				}
 			}
+			if blob != nil {
+				if f, ok := ctx.Value(blobReadyKey{}).(BlobReadyFunc); ok {
+					if desc, err := sr.readyBlobDesc(ctx, comp.Type, forceCompression); err != nil {
+						bklog.G(ctx).WithError(err).Debugf("failed to get descriptor of new blob for %s", sr.ID())
+					} else {
+						f(desc)
+					}
+				}
+			}
 			return nil
 		})
 	}
@@ -360,6 +369,35 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 		return err
 	}
 	return sr.computeChainMetadata(ctx, filter)
+}
+
+type blobReadyKey struct{}
+
+// BlobReadyFunc is called with the descriptor of a new layer blob as soon as
+// the blob is in the content store. It must not block.
+type BlobReadyFunc func(ocispecs.Descriptor)
+
+// WithBlobReadyFunc returns a context that makes GetRemotes call f for every
+// layer blob that it has to create, as soon as that blob is ready, rather than
+// when the whole chain is. The descriptors match the ones in the returned
+// remote. Layers that already had a blob are not reported.
+func WithBlobReadyFunc(ctx context.Context, f BlobReadyFunc) context.Context {
+	return context.WithValue(ctx, blobReadyKey{}, f)
+}
+
+// readyBlobDesc returns the descriptor that getRemote returns for a new blob.
+func (sr *immutableRef) readyBlobDesc(ctx context.Context, compressionType compression.Type, forceCompression bool) (ocispecs.Descriptor, error) {
+	desc, err := sr.ociDesc(ctx, sr.descHandlers, false)
+	if err != nil {
+		return ocispecs.Descriptor{}, err
+	}
+	if !forceCompression {
+		return desc, nil
+	}
+	if needs, err := compressionType.NeedsConversion(ctx, sr.cm.ContentStore, desc); err != nil || !needs {
+		return desc, err
+	}
+	return sr.getBlobWithCompression(ctx, compressionType)
 }
 
 // setBlob associates a blob with the cache record.

@@ -46,7 +46,45 @@ func Pusher(ctx context.Context, resolver remotes.Resolver, ref string) (remotes
 	return &pusher{Pusher: p}, nil
 }
 
-func Push(ctx context.Context, sm *session.Manager, sid string, provider content.Provider, manager content.Manager, dgst digest.Digest, ref string, insecure bool, hosts docker.RegistryHosts, byDigest bool, annotations map[digest.Digest]map[string]string) error {
+func newPusher(ctx context.Context, sm *session.Manager, sid string, parsed reference.Named, ref string, insecure bool, hosts docker.RegistryHosts) (remotes.Pusher, error) {
+	scope := resolver.ScopeType{Push: true}
+	if insecure {
+		insecureTrue := true
+		httpTrue := true
+		hosts = resolver.NewRegistryConfig(map[string]resolverconfig.RegistryConfig{
+			reference.Domain(parsed): {
+				Insecure:  &insecureTrue,
+				PlainHTTP: &httpTrue,
+			},
+		})
+		scope.Insecure = true
+	}
+
+	resolver := resolver.DefaultPool.GetResolver(hosts, ref, scope, sm, session.NewGroup(sid))
+	return Pusher(ctx, resolver, ref)
+}
+
+// Opt is an option for Push.
+type Opt func(*pushOpts)
+
+type pushOpts struct {
+	uploader *BlobUploader
+}
+
+// WithBlobUploader makes Push wait for the blobs that uploader has been asked
+// to upload, and skip the ones it uploaded successfully. uploader must upload
+// to the repository that Push pushes to.
+func WithBlobUploader(uploader *BlobUploader) Opt {
+	return func(o *pushOpts) {
+		o.uploader = uploader
+	}
+}
+
+func Push(ctx context.Context, sm *session.Manager, sid string, provider content.Provider, manager content.Manager, dgst digest.Digest, ref string, insecure bool, hosts docker.RegistryHosts, byDigest bool, annotations map[digest.Digest]map[string]string, opts ...Opt) error {
+	var o pushOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
 	ctx = contentutil.RegisterContentPayloadTypes(ctx)
 	desc := ocispecs.Descriptor{
 		Digest: dgst,
@@ -70,24 +108,17 @@ func Push(ctx context.Context, sm *session.Manager, sid string, provider content
 		ref = r.String()
 	}
 
-	scope := resolver.ScopeType{Push: true}
-	if insecure {
-		insecureTrue := true
-		httpTrue := true
-		hosts = resolver.NewRegistryConfig(map[string]resolverconfig.RegistryConfig{
-			reference.Domain(parsed): {
-				Insecure:  &insecureTrue,
-				PlainHTTP: &httpTrue,
-			},
-		})
-		scope.Insecure = true
-	}
-
-	resolver := resolver.DefaultPool.GetResolver(hosts, ref, scope, sm, session.NewGroup(sid))
-
-	pusher, err := Pusher(ctx, resolver, ref)
+	pusher, err := newPusher(ctx, sm, sid, parsed, ref, insecure, hosts)
 	if err != nil {
 		return err
+	}
+
+	dedupe := newDedupe()
+	if o.uploader != nil {
+		if o.uploader.repo != parsed.Name() {
+			return errors.Errorf("blob uploader for %s can't be used to push %s", o.uploader.repo, parsed.Name())
+		}
+		dedupe = o.uploader.dedupe
 	}
 
 	var m sync.Mutex
@@ -115,7 +146,7 @@ func Push(ctx context.Context, sm *session.Manager, sid string, provider content
 	handlers := append([]images.Handler{},
 		images.HandlerFunc(annotateDistributionSourceHandler(manager, annotations, childrenHandler(provider))),
 		filterHandler,
-		dedupeHandler(pushUpdateSourceHandler),
+		dedupe.handler(pushUpdateSourceHandler),
 	)
 
 	ra, err := provider.ReaderAt(ctx, desc)
@@ -129,6 +160,11 @@ func Push(ctx context.Context, sm *session.Manager, sid string, provider content
 	}
 
 	layersDone := progress.OneOff(ctx, "pushing layers")
+	if o.uploader != nil {
+		// Wait for the blobs that are being uploaded early. The ones that
+		// failed are retried by the dispatch below.
+		o.uploader.Wait()
+	}
 	err = images.Dispatch(ctx, skipNonDistributableBlobs(images.Handlers(handlers...)), nil, ocispecs.Descriptor{
 		Digest:    dgst,
 		Size:      ra.Size(),
@@ -188,30 +224,38 @@ func annotateDistributionSourceHandler(manager content.Manager, annotations map[
 					child.Annotations[k] = v
 				}
 			}
-			children[i] = child
-
-			info, err := manager.Info(ctx, child.Digest)
-			if errors.Is(err, cerrdefs.ErrNotFound) {
-				continue
-			} else if err != nil {
+			child, err := addDistributionSourceLabels(ctx, manager, child)
+			if err != nil {
 				return nil, err
 			}
-
-			for k, v := range info.Labels {
-				if !strings.HasPrefix(k, "containerd.io/distribution.source.") {
-					continue
-				}
-
-				if child.Annotations == nil {
-					child.Annotations = map[string]string{}
-				}
-				child.Annotations[k] = v
-			}
-
 			children[i] = child
 		}
 		return children, nil
 	}
+}
+
+// addDistributionSourceLabels copies the distribution source labels of desc
+// in the content store to its annotations, so that the pusher can mount it
+// from another repository.
+func addDistributionSourceLabels(ctx context.Context, manager content.Manager, desc ocispecs.Descriptor) (ocispecs.Descriptor, error) {
+	info, err := manager.Info(ctx, desc.Digest)
+	if errors.Is(err, cerrdefs.ErrNotFound) {
+		return desc, nil
+	} else if err != nil {
+		return desc, err
+	}
+
+	for k, v := range info.Labels {
+		if !strings.HasPrefix(k, "containerd.io/distribution.source.") {
+			continue
+		}
+
+		if desc.Annotations == nil {
+			desc.Annotations = map[string]string{}
+		}
+		desc.Annotations[k] = v
+	}
+	return desc, nil
 }
 
 func childrenHandler(provider content.Provider) images.HandlerFunc {
@@ -298,29 +342,109 @@ func updateDistributionSourceHandler(manager content.Manager, pushF images.Handl
 	}), nil
 }
 
-func dedupeHandler(h images.HandlerFunc) images.HandlerFunc {
-	var g flightcontrol.Group[[]ocispecs.Descriptor]
-	res := map[digest.Digest][]ocispecs.Descriptor{}
-	var mu sync.Mutex
+// dedupe runs a handler once per digest. Handlers built from the same dedupe
+// share the set of digests that were handled successfully.
+type dedupe struct {
+	g   flightcontrol.Group[[]ocispecs.Descriptor]
+	mu  sync.Mutex
+	res map[digest.Digest][]ocispecs.Descriptor
+}
 
+func newDedupe() *dedupe {
+	return &dedupe{res: map[digest.Digest][]ocispecs.Descriptor{}}
+}
+
+func (d *dedupe) handler(h images.HandlerFunc) images.HandlerFunc {
 	return images.HandlerFunc(func(ctx context.Context, desc ocispecs.Descriptor) ([]ocispecs.Descriptor, error) {
-		return g.Do(ctx, desc.Digest.String(), func(ctx context.Context) ([]ocispecs.Descriptor, error) {
-			mu.Lock()
-			if r, ok := res[desc.Digest]; ok {
-				mu.Unlock()
+		return d.g.Do(ctx, desc.Digest.String(), func(ctx context.Context) ([]ocispecs.Descriptor, error) {
+			d.mu.Lock()
+			if r, ok := d.res[desc.Digest]; ok {
+				d.mu.Unlock()
 				return r, nil
 			}
-			mu.Unlock()
+			d.mu.Unlock()
 
 			children, err := h(ctx, desc)
 			if err != nil {
 				return nil, err
 			}
 
-			mu.Lock()
-			res[desc.Digest] = children
-			mu.Unlock()
+			d.mu.Lock()
+			d.res[desc.Digest] = children
+			d.mu.Unlock()
 			return children, nil
 		})
 	})
+}
+
+// BlobUploader uploads blobs to a repository as soon as they are ready, ahead
+// of the Push of the image that references them. Pass it to Push with
+// WithBlobUploader so that Push skips the blobs it has already uploaded.
+//
+// Uploads are best effort: a failed upload is logged, and retried by Push.
+type BlobUploader struct {
+	ctx     context.Context
+	cancel  context.CancelCauseFunc
+	repo    string
+	manager content.Manager
+	handler images.HandlerFunc
+	dedupe  *dedupe
+	wg      sync.WaitGroup
+}
+
+// NewBlobUploader returns a BlobUploader for the repository of ref. Uploads
+// read the blobs from provider and stop when ctx is canceled or Close is
+// called.
+func NewBlobUploader(ctx context.Context, sm *session.Manager, sid string, provider content.Provider, manager content.Manager, ref string, insecure bool, hosts docker.RegistryHosts) (*BlobUploader, error) {
+	ctx = contentutil.RegisterContentPayloadTypes(ctx)
+	parsed, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return nil, err
+	}
+	ref = reference.TagNameOnly(parsed).String()
+	pusher, err := newPusher(ctx, sm, sid, parsed, ref, insecure, hosts)
+	if err != nil {
+		return nil, err
+	}
+	pushHandler := retryhandler.New(limited.PushHandler(pusher, provider, ref), logs.LoggerFromContext(ctx))
+	pushUpdateSourceHandler, err := updateDistributionSourceHandler(manager, pushHandler, ref)
+	if err != nil {
+		return nil, err
+	}
+	d := newDedupe()
+	ctx, cancel := context.WithCancelCause(ctx)
+	return &BlobUploader{
+		ctx:     ctx,
+		cancel:  cancel,
+		repo:    parsed.Name(),
+		manager: manager,
+		handler: skipNonDistributableBlobs(d.handler(pushUpdateSourceHandler)),
+		dedupe:  d,
+	}, nil
+}
+
+// Upload starts uploading desc in the background. Upload does not block.
+func (u *BlobUploader) Upload(desc ocispecs.Descriptor) {
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		desc, err := addDistributionSourceLabels(u.ctx, u.manager, desc)
+		if err == nil {
+			_, err = u.handler(u.ctx, desc)
+		}
+		if err != nil && u.ctx.Err() == nil {
+			bklog.G(u.ctx).WithError(err).WithField("digest", desc.Digest).Warn("early blob upload failed, retrying in push")
+		}
+	}()
+}
+
+// Wait waits for every upload started so far.
+func (u *BlobUploader) Wait() {
+	u.wg.Wait()
+}
+
+// Close cancels the uploads in progress and waits for them to return.
+func (u *BlobUploader) Close() {
+	u.cancel(errors.WithStack(context.Canceled))
+	u.wg.Wait()
 }
