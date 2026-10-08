@@ -94,6 +94,9 @@ type WorkerOpt struct {
 	MountPoolRoot    string
 	ResourceMonitor  *resources.Monitor
 	CDIManager       *cdidevices.Manager
+	// ParallelUnpack extracts image layers in parallel when the snapshotter
+	// supports it. See cache.ManagerOpt.
+	ParallelUnpack bool
 }
 
 // Worker is a local worker instance with dedicated snapshotter, cache, and so on.
@@ -128,6 +131,7 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 		MetadataStore:   opt.MetadataStore,
 		Root:            opt.Root,
 		MountPoolRoot:   opt.MountPoolRoot,
+		ParallelUnpack:  opt.ParallelUnpack,
 	})
 	if err != nil {
 		return nil, err

@@ -104,6 +104,10 @@ provenanceEnvDir = "/etc/buildkit/provenance.d"
   # Whether run subprocesses in main pid namespace or not, this is useful for
   # running rootless buildkit inside a container.
   noProcessSandbox = false
+  # parallelUnpack extracts the layers of a pulled image in parallel, each
+  # as soon as its blob is downloaded, instead of one after another from the
+  # bottom. Only used with the overlayfs snapshotter outside rootless mode.
+  parallelUnpack = false
   # gc enables/disables garbage collection
   gc = true
   # reservedSpace is the minimum amount of disk space guaranteed to be

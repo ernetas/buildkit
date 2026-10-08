@@ -63,6 +63,7 @@ type cmOpt struct {
 	snapshotterName string
 	snapshotter     snapshots.Snapshotter
 	tmpdir          string
+	parallelUnpack  bool
 }
 
 type cmOut struct {
@@ -185,6 +186,7 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, c
 		Differ:         differ,
 		Root:           tmpdir,
 		MountPoolRoot:  filepath.Join(tmpdir, "cachemounts"),
+		ParallelUnpack: opt.parallelUnpack,
 	})
 	if err != nil {
 		return nil, nil, err

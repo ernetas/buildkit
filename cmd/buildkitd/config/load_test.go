@@ -295,6 +295,16 @@ func TestLoadLayerFetch(t *testing.T) {
 	require.Equal(t, int64(16<<20), cfg.System.LayerFetchChunkSize.Bytes)
 }
 
+func TestLoadParallelUnpack(t *testing.T) {
+	cfg, err := Load(bytes.NewBufferString("[worker.oci]\n"))
+	require.NoError(t, err)
+	require.False(t, cfg.Workers.OCI.ParallelUnpack)
+
+	cfg, err = Load(bytes.NewBufferString("[worker.oci]\nparallelUnpack = true\n"))
+	require.NoError(t, err)
+	require.True(t, cfg.Workers.OCI.ParallelUnpack)
+}
+
 func TestLoadSessionAuthTimeout(t *testing.T) {
 	tests := []struct {
 		name    string

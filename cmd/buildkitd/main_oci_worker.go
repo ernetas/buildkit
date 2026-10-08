@@ -336,6 +336,8 @@ func ociWorkerInitializer(c *cli.Command, common workerInitializerOpt) ([]worker
 	opt.GCPolicy = getGCPolicy(cfg.GCConfig, common.config.Root)
 	opt.BuildkitVersion = getBuildkitVersion()
 	opt.RegistryHosts = hosts
+	// only the in-process overlayfs snapshotter is known to rebase on commit
+	opt.ParallelUnpack = cfg.ParallelUnpack && snFactory.Name == "overlayfs" && cfg.ProxySnapshotterPath == "" && !cfg.Rootless
 
 	if platformsStr := cfg.Platforms; len(platformsStr) != 0 {
 		platforms, err := parsePlatforms(platformsStr)

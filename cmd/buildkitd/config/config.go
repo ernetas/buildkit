@@ -191,6 +191,9 @@ type OCIConfig struct {
 	Snapshotter      string            `toml:"snapshotter"`
 	Rootless         bool              `toml:"rootless"`
 	NoProcessSandbox bool              `toml:"noProcessSandbox"`
+	// ParallelUnpack extracts the layers of an image in parallel. Only
+	// supported with the overlayfs snapshotter; ignored otherwise.
+	ParallelUnpack bool `toml:"parallelUnpack"`
 	GCConfig
 	NetworkConfig
 	// UserRemapUnsupported is unsupported key for testing. The feature is

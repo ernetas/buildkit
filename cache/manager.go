@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ import (
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 var (
@@ -56,6 +58,10 @@ type ManagerOpt struct {
 	MetadataStore   *metadata.Store
 	Root            string
 	MountPoolRoot   string
+	// ParallelUnpack extracts the layers of an image in parallel and commits
+	// them onto their parents in order. It is ignored unless the snapshotter
+	// is the in-process overlayfs snapshotter, which can rebase on commit.
+	ParallelUnpack bool
 }
 
 type Accessor interface {
@@ -106,6 +112,10 @@ type cacheManager struct {
 
 	muPrune sync.Mutex // make sure parallel prune is not allowed so there will not be inconsistent results
 	unlazyG flightcontrol.Group[struct{}]
+
+	// unpackSem limits the layers extracted in parallel; nil when layers are
+	// extracted one after another.
+	unpackSem *semaphore.Weighted
 }
 
 // isLegacyLayerSnapshotID reports whether ref uses a pre-versioning layer snapshot ID.
@@ -148,6 +158,9 @@ func NewManager(opt ManagerOpt) (Manager, error) {
 		MetadataStore:   opt.MetadataStore,
 		root:            opt.Root,
 		records:         make(map[string]*cacheRecord),
+	}
+	if opt.ParallelUnpack && detachedApplySupported(opt.Snapshotter.Name()) {
+		cm.unpackSem = semaphore.NewWeighted(int64(min(runtime.NumCPU(), maxParallelUnpack)))
 	}
 
 	if err := cm.init(context.TODO()); err != nil {

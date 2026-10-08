@@ -1341,6 +1341,7 @@ func (sr *immutableRef) unlazyLayer(ctx context.Context, dhs DescHandlers, pg pr
 	}
 
 	removeActive := false
+	collectDetached := false
 	var activeKey string
 	defer func() {
 		ctx := context.WithoutCancel(ctx)
@@ -1356,7 +1357,7 @@ func (sr *immutableRef) unlazyLayer(ctx context.Context, dhs DescHandlers, pg pr
 				bklog.G(ctx).Warn(errors.Wrapf(err, "failed to delete active snapshot %s from lease %s", activeKey, leaseID))
 			}
 		}
-		if removeActive && sr.cm.GarbageCollect != nil {
+		if (removeActive || collectDetached) && sr.cm.GarbageCollect != nil {
 			if _, err := sr.cm.GarbageCollect(ctx); err != nil {
 				bklog.G(ctx).Warn(errors.Wrapf(err, "failed to garbage collect active snapshot %s", activeKey))
 			}
@@ -1367,7 +1368,9 @@ func (sr *immutableRef) unlazyLayer(ctx context.Context, dhs DescHandlers, pg pr
 		ctx = winlayers.UseWindowsLayerMode(ctx)
 	}
 
-	eg, egctx := errgroup.WithContext(ctx)
+	egParentCtx, cancelEg := context.WithCancelCause(ctx)
+	defer cancelEg(nil)
+	eg, egctx := errgroup.WithContext(egParentCtx)
 
 	parentID := ""
 	if sr.layerParent != nil {
@@ -1386,7 +1389,9 @@ func (sr *immutableRef) unlazyLayer(ctx context.Context, dhs DescHandlers, pg pr
 	}
 	dh := dhs[desc.Digest]
 
+	downloaded := make(chan struct{})
 	eg.Go(func() error {
+		defer close(downloaded)
 		// unlazies if needed, otherwise a no-op
 		return lazyRefProvider{
 			ref:     sr,
@@ -1396,8 +1401,61 @@ func (sr *immutableRef) unlazyLayer(ctx context.Context, dhs DescHandlers, pg pr
 		}.Unlazy(egctx)
 	})
 
+	// With a snapshotter that can rebase on commit, extract the layer into a
+	// snapshot without parent as soon as its blob is available, while the
+	// parent is still being downloaded or extracted.
+	var detached *detachedLayer
+	if sr.layerParent != nil && sr.cm.unpackSem != nil && sr.GetLayerType() != "windows" {
+		select {
+		case <-downloaded:
+		case <-egctx.Done():
+		}
+		if egctx.Err() == nil {
+			detachedPg := pg
+			if detachedPg == nil && dh != nil {
+				detachedPg = dh.Progress
+			}
+			detached, err = sr.applyDetached(egctx, desc, detachedPg)
+			if detached != nil {
+				activeKey = detached.key
+				removeActive = true
+			}
+			if err != nil {
+				if egctx.Err() != nil {
+					// the parent or the download failed first
+					if werr := eg.Wait(); werr != nil {
+						return werr
+					}
+					return err
+				}
+				cancelEg(err)
+				_ = eg.Wait()
+				return err
+			}
+		}
+	}
+
 	if err := eg.Wait(); err != nil {
 		return err
+	}
+
+	if detached != nil {
+		committed, err := sr.commitDetached(ctx, detached, parentID, s)
+		if err != nil {
+			return err
+		}
+		if committed {
+			removeActive = false
+			sr.queueBlobOnly(false)
+			sr.queueSize(sizeUnknown)
+			return sr.commitMetadata()
+		}
+		// The layer has to be applied on top of its parent after all. Drop
+		// the detached snapshot; the deferred cleanup collects it.
+		if err := sr.releaseSnapshot(ctx, detached.key); err != nil {
+			return err
+		}
+		collectDetached = true
 	}
 
 	if pg == nil && dh != nil {
