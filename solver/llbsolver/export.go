@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/moby/buildkit/cache"
@@ -179,21 +180,33 @@ func exporterVertexID(sessionID string, exporterIndex int) string {
 	return fmt.Sprint(sessionID, "-export-", exporterIndex)
 }
 
-func (s *Solver) runExporters(ctx context.Context, ref string, exporters []exporter.ExporterInstance, inlineCacheExporter inlineCacheExporter, job *solver.Job, cached *result.Result[solver.CachedResult], inp *exporter.Source) (exporterResponse map[string]string, finalizers []exporter.FinalizeFunc, descrefs []exporter.DescriptorReference, err error) {
+// runExporters runs every exporter and the finalize callback (e.g. the registry
+// push) that its Export returns. Each finalize starts as soon as its own
+// exporter's Export has returned, without waiting for the other exporters.
+// afterExport (the cache exporters) runs alongside the finalize callbacks once
+// every Export has returned, so it can reuse the layers they created.
+func (s *Solver) runExporters(ctx context.Context, ref string, exporters []exporter.ExporterInstance, inlineCacheExporter inlineCacheExporter, job *solver.Job, cached *result.Result[solver.CachedResult], inp *exporter.Source, afterExport func(context.Context) error) (exporterResponse map[string]string, descrefs []exporter.DescriptorReference, err error) {
 	warnings, err := verifier.CheckInvalidPlatforms(ctx, inp)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	eg, ctx := errgroup.WithContext(ctx)
 	resps := make([]map[string]string, len(exporters))
-	finalizeFuncs := make([]exporter.FinalizeFunc, len(exporters))
 	descs := make([]exporter.DescriptorReference, len(exporters))
 	var inlineCacheMu sync.Mutex
+	// exportsDone is closed once every Export has returned successfully.
+	exportsDone := make(chan struct{})
+	var exportsPending atomic.Int64
+	exportsPending.Store(int64(len(exporters)))
+	if len(exporters) == 0 {
+		close(exportsDone)
+	}
 	for i, exp := range exporters {
 		id := exporterVertexID(job.SessionID, i)
 		eg.Go(func() error {
-			return inBuilderContext(ctx, job, exp.Name(), id, func(ctx context.Context, _ solver.JobContext) error {
+			var finalize exporter.FinalizeFunc
+			err := inBuilderContext(ctx, job, exp.Name(), id, func(ctx context.Context, _ solver.JobContext) error {
 				span, ctx := tracing.StartSpan(ctx, exp.Name())
 				defer span.End()
 
@@ -216,22 +229,47 @@ func (s *Solver) runExporters(ctx context.Context, ref string, exporters []expor
 					return err
 				}
 
-				resp, finalize, desc, expErr := exp.Export(ctx, inp, exporter.ExportBuildInfo{
+				resp, f, desc, expErr := exp.Export(ctx, inp, exporter.ExportBuildInfo{
 					Ref:                  ref,
 					SessionID:            job.SessionID,
 					InlineCache:          inlineCache,
 					CompatibilityVersion: compatibilityVersion,
 				})
-				resps[i], finalizeFuncs[i], descs[i] = resp, finalize, desc
+				resps[i], finalize, descs[i] = resp, f, desc
 				if expErr != nil {
 					return expErr
 				}
 				return nil
 			})
+			if err != nil {
+				return err
+			}
+			if exportsPending.Add(-1) == 0 {
+				close(exportsDone)
+			}
+			if finalize == nil {
+				return nil
+			}
+			// Start this exporter's finalize (e.g. the registry push) right
+			// away instead of waiting for the other exporters, e.g. the
+			// tarball of --load.
+			return inBuilderContext(ctx, job, exp.Name(), id, func(ctx context.Context, _ solver.JobContext) error {
+				return finalize(ctx)
+			})
+		})
+	}
+	if afterExport != nil {
+		eg.Go(func() error {
+			select {
+			case <-exportsDone:
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			}
+			return afterExport(ctx)
 		})
 	}
 	if err := eg.Wait(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	if len(exporters) == 0 && len(warnings) > 0 {
@@ -243,7 +281,7 @@ func (s *Solver) runExporters(ctx context.Context, ref string, exporters []expor
 			return pw.Close()
 		})
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -258,7 +296,7 @@ func (s *Solver) runExporters(ctx context.Context, ref string, exporters []expor
 		}
 	}
 
-	return exporterResponse, finalizeFuncs, descs, nil
+	return exporterResponse, descs, nil
 }
 
 func splitCacheExporters(exporters []RemoteCacheExporter) (rest []RemoteCacheExporter, inline inlineCacheExporter) {

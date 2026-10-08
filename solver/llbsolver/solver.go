@@ -404,36 +404,17 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 		exp.Exporters = append(exp.Exporters, exporters...)
 	}
 
+	// Image finalize (push) and cache export run in parallel. Cache exporters
+	// start once every exporter's Export has created its layers in the
+	// content store, so they can see and reuse them.
 	var exporterResponse map[string]string
-	var finalizers []exporter.FinalizeFunc
-	exporterResponse, finalizers, descrefs, err = s.runExporters(ctx, id, exp.Exporters, inlineCacheExporter, j, cached, inp)
-	if err != nil {
-		return nil, err
-	}
-
-	// Run image finalize and cache export in parallel.
-	// Image Export has already created layers in the content store,
-	// so cache exporters can see and reuse them.
-	eg, egCtx := errgroup.WithContext(ctx)
-	for i, finalize := range finalizers {
-		if finalize == nil {
-			continue
-		}
-		name := exp.Exporters[i].Name()
-		id := exporterVertexID(j.SessionID, i)
-		eg.Go(func() error {
-			return inBuilderContext(egCtx, j, name, id, func(ctx context.Context, _ solver.JobContext) error {
-				return finalize(ctx)
-			})
-		})
-	}
 	var cacheExporterResponse map[string]string
-	eg.Go(func() error {
+	exporterResponse, descrefs, err = s.runExporters(ctx, id, exp.Exporters, inlineCacheExporter, j, cached, inp, func(ctx context.Context) error {
 		var err error
-		cacheExporterResponse, err = runCacheExporters(egCtx, cacheExporters, j, cached, inp)
+		cacheExporterResponse, err = runCacheExporters(ctx, cacheExporters, j, cached, inp)
 		return err
 	})
-	if err := eg.Wait(); err != nil {
+	if err != nil {
 		return nil, err
 	}
 
