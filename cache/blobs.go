@@ -11,6 +11,7 @@ import (
 	"path"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	obdlabel "github.com/containerd/accelerated-container-image/pkg/label"
@@ -37,7 +38,41 @@ import (
 )
 
 var g flightcontrol.Group[*leaseutil.LeaseRef]
+var gBlob flightcontrol.Group[*computedBlob]
 var gFileList flightcontrol.Group[[]string]
+
+// computedBlob is the result of a blob computation shared between concurrent
+// computeBlobChain callers.
+type computedBlob struct {
+	lease *leaseutil.LeaseRef
+	// comp is the compression type the blob was created with.
+	comp compression.Type
+}
+
+// blobChainResult collects per-ref results of a single computeBlobChain call.
+type blobChainResult struct {
+	mu sync.Mutex
+	// variants holds the IDs of refs whose blob was created during this call
+	// by a concurrent caller that asked for another compression type. This
+	// caller uses the variant with its own compression type for them.
+	variants map[string]struct{}
+}
+
+func (r *blobChainResult) addVariant(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.variants == nil {
+		r.variants = map[string]struct{}{}
+	}
+	r.variants[id] = struct{}{}
+}
+
+func (r *blobChainResult) needsVariant(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.variants[id]
+	return ok
+}
 
 var ErrNoBlobs = errors.Errorf("no blobs for snapshot")
 
@@ -45,21 +80,22 @@ var ErrNoBlobs = errors.Errorf("no blobs for snapshot")
 // a blob is missing and createIfNeeded is true, then the blob will be created, otherwise ErrNoBlobs will
 // be returned. Caller must hold a lease when calling this function.
 // If forceCompression is specified but the blob of compressionType doesn't exist, this function creates it.
-func (sr *immutableRef) computeBlobChain(ctx context.Context, createIfNeeded bool, comp compression.Config, s session.Group) error {
+func (sr *immutableRef) computeBlobChain(ctx context.Context, createIfNeeded bool, comp compression.Config, s session.Group) (*blobChainResult, error) {
+	res := &blobChainResult{}
 	if _, ok := leases.FromContext(ctx); !ok {
-		return errors.Errorf("missing lease requirement for computeBlobChain")
+		return nil, errors.Errorf("missing lease requirement for computeBlobChain")
 	}
 	if !createIfNeeded {
 		sr.mu.Lock()
 		if sr.equalMutable != nil {
 			sr.mu.Unlock()
-			return nil
+			return res, nil
 		}
 		sr.mu.Unlock()
 	}
 
 	if err := sr.Finalize(ctx); err != nil {
-		return err
+		return nil, err
 	}
 
 	if isTypeWindows(sr) {
@@ -71,34 +107,37 @@ func (sr *immutableRef) computeBlobChain(ctx context.Context, createIfNeeded boo
 	// refs rather than every single layer present among their ancestors.
 	filter := sr.layerSet()
 
-	return computeBlobChain(ctx, sr, createIfNeeded, comp, s, filter)
+	if err := computeBlobChain(ctx, sr, createIfNeeded, comp, s, filter, res); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
-func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, comp compression.Config, s session.Group, filter map[string]struct{}) error {
+func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, comp compression.Config, s session.Group, filter map[string]struct{}, res *blobChainResult) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	switch sr.kind() {
 	case Merge:
 		for _, parent := range sr.mergeParents {
 			eg.Go(func() error {
-				return computeBlobChain(ctx, parent, createIfNeeded, comp, s, filter)
+				return computeBlobChain(ctx, parent, createIfNeeded, comp, s, filter, res)
 			})
 		}
 	case Diff:
 		if _, ok := filter[sr.ID()]; !ok && sr.diffParents.upper != nil {
 			// This diff is just re-using the upper blob, compute that
 			eg.Go(func() error {
-				return computeBlobChain(ctx, sr.diffParents.upper, createIfNeeded, comp, s, filter)
+				return computeBlobChain(ctx, sr.diffParents.upper, createIfNeeded, comp, s, filter, res)
 			})
 		}
 	case Layer:
 		eg.Go(func() error {
-			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, comp, s, filter)
+			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, comp, s, filter, res)
 		})
 	}
 
 	if _, ok := filter[sr.ID()]; ok {
 		eg.Go(func() error {
-			l, err := g.Do(ctx, fmt.Sprintf("%s-%t", sr.ID(), createIfNeeded), func(ctx context.Context) (_ *leaseutil.LeaseRef, err error) {
+			blob, err := gBlob.Do(ctx, fmt.Sprintf("%s-%t", sr.ID(), createIfNeeded), func(ctx context.Context) (_ *computedBlob, err error) {
 				if sr.getBlob() != "" {
 					return nil, nil
 				}
@@ -287,19 +326,28 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 				if err := sr.setBlob(ctx, desc); err != nil {
 					return nil, err
 				}
-				return l, nil
+				return &computedBlob{lease: l, comp: comp.Type}, nil
 			})
 			if err != nil {
 				return err
 			}
 
-			if l != nil {
-				if err := l.Adopt(ctx); err != nil {
+			forceCompression := comp.Force
+			if blob != nil {
+				if err := blob.lease.Adopt(ctx); err != nil {
 					return err
+				}
+				// The blob did not exist when this call started. If a
+				// concurrent call with another compression type created it,
+				// this caller still gets the compression type it asked for,
+				// as it would have without the concurrent call.
+				if !comp.Force && blob.comp.String() != comp.Type.String() {
+					forceCompression = true
+					res.addVariant(sr.ID())
 				}
 			}
 
-			if comp.Force {
+			if forceCompression {
 				if err := ensureCompression(ctx, sr, comp, s); err != nil {
 					return errors.Wrapf(err, "failed to ensure compression type of %q", comp.Type)
 				}

@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2414,6 +2415,89 @@ func checkVariantsCoverage(ctx context.Context, t *testing.T, variants idxToVari
 		delete(got, d.Digest)
 	}
 	require.Equal(t, 0, len(got))
+}
+
+// TestGetRemotesConcurrentCompression checks that concurrent GetRemotes calls
+// that create the same new layer with different (non-forced) compression
+// types each get a blob of the compression type they asked for. Exporters run
+// concurrently, and the layer used to end up with whichever compression type
+// started computing the blob first, for every exporter.
+func TestGetRemotesConcurrentCompression(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS != "linux" {
+		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
+	}
+
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+
+	tmpdir := t.TempDir()
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager
+
+	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
+	require.NoError(t, err)
+	defer done(context.WithoutCancel(ctx))
+
+	// The layer must be large enough that computing its blob takes much
+	// longer than starting two goroutines, so that both calls are in flight
+	// at the same time.
+	data := make([]byte, 16<<20)
+	rng := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // test data
+	for i := range data {
+		data[i] = byte(rng.IntN(64)) + '0'
+	}
+
+	types := []compression.Type{compression.Gzip, compression.Zstd}
+	for i := range 4 {
+		mutRef, err := cm.New(ctx, nil, nil)
+		require.NoError(t, err)
+		m, err := mutRef.Mount(ctx, false, nil)
+		require.NoError(t, err)
+		lm := snapshot.LocalMounter(m)
+		target, err := lm.Mount()
+		require.NoError(t, err)
+		data[0] = byte(i) // a new blob for every layer
+		require.NoError(t, os.WriteFile(filepath.Join(target, "data"), data, 0600))
+		require.NoError(t, lm.Unmount())
+		ref, err := mutRef.Commit(ctx)
+		require.NoError(t, err)
+
+		start := make(chan struct{})
+		mediaTypes := make([]string, len(types))
+		eg, egctx := errgroup.WithContext(ctx)
+		for j, ct := range types {
+			eg.Go(func() error {
+				<-start
+				remotes, err := ref.GetRemotes(egctx, true, config.RefConfig{Compression: compression.New(ct)}, false, nil)
+				if err != nil {
+					return err
+				}
+				if len(remotes) != 1 || len(remotes[0].Descriptors) != 1 {
+					return errors.Errorf("unexpected remotes %+v", remotes)
+				}
+				desc := remotes[0].Descriptors[0]
+				if _, err := co.cs.Info(egctx, desc.Digest); err != nil {
+					return err
+				}
+				mediaTypes[j] = desc.MediaType
+				return nil
+			})
+		}
+		close(start)
+		require.NoError(t, eg.Wait())
+		require.Equal(t, ocispecs.MediaTypeImageLayerGzip, mediaTypes[0], "layer %d: gzip caller got the wrong compression", i)
+		require.Equal(t, ocispecs.MediaTypeImageLayerZstd, mediaTypes[1], "layer %d: zstd caller got the wrong compression", i)
+		require.NoError(t, ref.Release(ctx))
+	}
 }
 
 // Make sure that media type and urls are persisted for non-distributable blobs.
